@@ -59,7 +59,6 @@ class WithinSessionConfig:
     max_timepoints: int | None = None
     min_trials_per_timepoint: int = 8
     n_jobs: int = 1
-    fallback_to_loo_on_small_class: bool = False
 
 
 VALID_DECODING_MODES = {"fixed_memory_3frames", "dynamic_time_window"}
@@ -654,8 +653,9 @@ def build_dynamic_window_features(
     Before cue onset, the window is trial start through ``eval_index``.
     From cue onset onward, the window is cue onset through ``eval_index``.
     Frames are concatenated in temporal order, with a fixed voxel order
-    within each frame. Missing/non-finite samples are excluded from this
-    timepoint rather than imputed with future data.
+    within each frame. Missing/non-finite samples are handled at the
+    voxel/feature level rather than by dropping whole trials, matching the
+    MATLAB offline BCI workflow.
     """
 
     if eval_index < cue_index:
@@ -673,7 +673,8 @@ def build_dynamic_window_features(
         raise ValueError("No valid voxels remain after applying finite/background mask.")
 
     trial_ok = np.asarray(valid_trial_mask, dtype=bool).copy()
-    trial_ok &= np.isfinite(images[:, :, frame_indices, :]).all(axis=(0, 1, 2))
+    if trial_ok.size != n_trials:
+        raise ValueError(f"valid_trial_mask has {trial_ok.size} entries; images have {n_trials} trials.")
     trial_indices = np.where(trial_ok)[0]
     features = np.empty((trial_indices.size, n_voxels * frame_indices.size), dtype=np.float32)
     for row, trial in enumerate(trial_indices):
@@ -681,6 +682,7 @@ def build_dynamic_window_features(
         for frame in frame_indices:
             chunks.append(images[:, :, frame, trial][voxel_mask].reshape(-1, order="F"))
         features[row, :] = np.concatenate(chunks)
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
 
     info = {
         "eval_index": int(eval_index),
@@ -731,7 +733,6 @@ def build_fixed_memory_3frames_features(
     trial_ok = np.asarray(valid_trial_mask, dtype=bool).copy()
     if trial_ok.size != n_trials:
         raise ValueError(f"valid_trial_mask has {trial_ok.size} entries; images have {n_trials} trials.")
-    trial_ok &= np.isfinite(images[:, :, frame_indices, :]).all(axis=(0, 1, 2))
     trial_indices = np.where(trial_ok)[0]
     features = np.empty((trial_indices.size, n_voxels * frame_indices.size), dtype=np.float32)
     for row, trial in enumerate(trial_indices):
@@ -740,6 +741,7 @@ def build_fixed_memory_3frames_features(
             for frame in frame_indices
         ]
         features[row, :] = np.concatenate(chunks)
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
 
     eval_index = int(frame_indices[-1])
     info = {
@@ -768,15 +770,6 @@ def _make_cv_splits(y: np.ndarray, config: WithinSessionConfig) -> list[tuple[np
             raise ValueError("No class labels available for CV.")
         k = min(config.n_splits, int(positive_counts.min()))
         if k < 2:
-            if config.fallback_to_loo_on_small_class:
-                LOGGER.warning(
-                    "Smallest combined-direction class has %d sample; falling back from "
-                    "stratified %d-fold CV to leave-one-out CV.",
-                    int(positive_counts.min()),
-                    config.n_splits,
-                )
-                cv = sklearn_model_selection.LeaveOneOut()
-                return list(cv.split(np.arange(n)))
             raise ValueError(
                 f"Cannot run stratified {config.n_splits}-fold CV; smallest class has {positive_counts.min()} sample."
             )
@@ -812,6 +805,8 @@ def fit_fold_scaler_pca_lda(
     sigma[tiny] = 1.0
     z_train = (x_train - mu) / sigma
     z_test = (x_test - mu) / sigma
+    z_train = np.nan_to_num(z_train, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+    z_test = np.nan_to_num(z_test, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
 
     # MATLAB ``pca`` chooses enough components for 95% explained variance.
     # scikit-learn's full SVD PCA with n_components in (0,1) is the closest
@@ -1466,11 +1461,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--n-permutations", type=int, default=100_000)
     parser.add_argument("--max-timepoints", type=int, default=None)
-    parser.add_argument(
-        "--fallback-to-loo-on-small-class",
-        action="store_true",
-        help="If stratified k-fold is impossible because a class has one sample, use leave-one-out CV.",
-    )
     parser.add_argument("--no-motion-correction", action="store_true")
     parser.add_argument("--no-detrend", action="store_true")
     parser.add_argument("--no-spatial-filter", action="store_true")
@@ -1484,7 +1474,6 @@ def main(argv: list[str] | None = None) -> int:
         n_permutations=args.n_permutations,
         output_dir=args.output_dir,
         max_timepoints=args.max_timepoints,
-        fallback_to_loo_on_small_class=args.fallback_to_loo_on_small_class,
         apply_motion_correction=not args.no_motion_correction,
         detrend_window=0 if args.no_detrend else WithinSessionConfig.detrend_window,
         spatial_filter_radius=0 if args.no_spatial_filter else WithinSessionConfig.spatial_filter_radius,

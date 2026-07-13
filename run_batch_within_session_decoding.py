@@ -154,18 +154,6 @@ def _summary_row(
     return row
 
 
-def _load_existing_summary(session_output_dir: Path, session_id: str) -> dict[str, Any] | None:
-    json_path = session_output_dir / f"{session_id}_within_session_decoding.json"
-    if not json_path.exists():
-        return None
-    with json_path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    summary = payload.get("summary")
-    if not isinstance(summary, dict):
-        return None
-    return summary
-
-
 def _write_batch_outputs(rows: list[dict[str, Any]], config: WithinSessionConfig, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "batch_summary.csv"
@@ -206,11 +194,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--include-nondecodable", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="Reuse sessions that already have a saved *_within_session_decoding.json in the output dir.",
-    )
     parser.add_argument("--stop-on-error", action="store_true")
     parser.add_argument(
         "--mode",
@@ -226,11 +209,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--n-permutations", type=int, default=100_000)
     parser.add_argument("--max-timepoints", type=int, default=None)
-    parser.add_argument(
-        "--fallback-to-loo-on-small-class",
-        action="store_true",
-        help="If stratified k-fold is impossible because a class has one sample, use leave-one-out CV.",
-    )
     parser.add_argument("--no-motion-correction", action="store_true")
     parser.add_argument("--no-detrend", action="store_true")
     parser.add_argument("--no-spatial-filter", action="store_true")
@@ -251,7 +229,6 @@ def main(argv: list[str] | None = None) -> int:
         n_permutations=args.n_permutations,
         output_dir=str(output_dir),
         max_timepoints=args.max_timepoints,
-        fallback_to_loo_on_small_class=args.fallback_to_loo_on_small_class,
         apply_motion_correction=not args.no_motion_correction,
         detrend_window=0 if args.no_detrend else WithinSessionConfig.detrend_window,
         spatial_filter_radius=0 if args.no_spatial_filter else WithinSessionConfig.spatial_filter_radius,
@@ -279,22 +256,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n[{index}/{len(selected_records)}] {token}")
         print(f"  input:  {mat_path}")
         print(f"  output: {session_output_dir}")
-
-        if args.skip_existing:
-            existing_summary = _load_existing_summary(session_output_dir, token)
-            if existing_summary:
-                print("  status: already complete; reusing existing result")
-                rows.append(
-                    _summary_row(
-                        status="ok",
-                        record=record,
-                        mat_path=mat_path,
-                        output_dir=session_output_dir,
-                        summary=existing_summary,
-                    )
-                )
-                _write_batch_outputs(rows, config, output_dir)
-                continue
 
         if not mat_path.exists():
             print("  status: missing input file")
