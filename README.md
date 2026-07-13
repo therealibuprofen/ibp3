@@ -76,6 +76,19 @@ Optional filters:
 --sessions S27
 ```
 
+To rerun only sessions that failed in a previous batch summary:
+
+```bash
+MPLCONFIGDIR=/tmp/ppc_matplotlib_cache .venv/bin/python run_batch_within_session_decoding.py \
+  --data-root /data2/yuq1ngr/dataset/data2 \
+  --doppler-dir /data2/yuq1ngr/dataset/data2/doppler \
+  --project-record /data2/yuq1ngr/dataset/data2/projectrecord \
+  --output-dir /data2/yuq1ngr/ibp3/output/python_within_session_batch_rerun_failed \
+  --rerun-failed-from-summary /data2/yuq1ngr/ibp3/output/python_within_session_batch/batch_summary.csv \
+  --cv-scheme kfold \
+  --n-permutations 100000
+```
+
 ## Notes
 
 - Input files are MATLAB v7.3 task-aligned `doppler_S*_R*+normcorre.mat`

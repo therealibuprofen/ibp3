@@ -99,6 +99,33 @@ def _matches_session_filter(token: str, filters: set[str] | None) -> bool:
     return token in filters or session_part in filters
 
 
+def _load_failed_session_filters(summary_path: Path) -> set[str]:
+    if not summary_path.exists():
+        raise FileNotFoundError(f"Failed-session summary CSV does not exist: {summary_path}")
+
+    failed: set[str] = set()
+    with summary_path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            status = (row.get("status") or "").strip().lower()
+            error = (row.get("error") or "").strip()
+            if status != "error" and not error:
+                continue
+
+            token = (row.get("session_id") or "").strip()
+            if not token:
+                session = (row.get("session") or "").strip()
+                run = (row.get("run") or "").strip()
+                if session and run:
+                    token = f"S{int(float(session))}_R{int(float(run))}"
+            if token:
+                failed.add(token)
+
+    if not failed:
+        raise ValueError(f"No failed sessions found in {summary_path}")
+    return failed
+
+
 def _summary_row(
     *,
     status: str,
@@ -192,6 +219,15 @@ def main(argv: list[str] | None = None) -> int:
         nargs="*",
         help="Optional filters, e.g. S27_R99 S76_R1, 27:99, or 27.",
     )
+    parser.add_argument(
+        "--rerun-failed-from-summary",
+        type=Path,
+        default=None,
+        help=(
+            "Read a previous batch_summary.csv and only run rows with status=error "
+            "or a non-empty error column. Can be combined with --sessions to further narrow the set."
+        ),
+    )
     parser.add_argument("--include-nondecodable", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")
@@ -219,6 +255,11 @@ def main(argv: list[str] | None = None) -> int:
     project_record_path = (args.project_record or _find_project_record(data_root)).expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     session_filters = _parse_session_filters(args.sessions)
+    failed_session_filters = (
+        _load_failed_session_filters(args.rerun_failed_from_summary.expanduser().resolve())
+        if args.rerun_failed_from_summary
+        else None
+    )
 
     records = _load_project_record(project_record_path)
     config = WithinSessionConfig(
@@ -239,6 +280,8 @@ def main(argv: list[str] | None = None) -> int:
         token = _session_token(record)
         if not _matches_session_filter(token, session_filters):
             continue
+        if not _matches_session_filter(token, failed_session_filters):
+            continue
         if not args.include_nondecodable and not _record_is_decodable(record):
             continue
         selected_records.append(record)
@@ -246,6 +289,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Project record: {project_record_path}")
     print(f"Doppler dir:    {doppler_dir}")
     print(f"Output dir:     {output_dir}")
+    if failed_session_filters is not None:
+        print(f"Failed summary: {args.rerun_failed_from_summary.expanduser().resolve()}")
+        print(f"Failed rows:    {len(failed_session_filters)} session ids")
     print(f"Sessions:       {len(selected_records)} selected from {len(records)} records")
 
     rows: list[dict[str, Any]] = []
