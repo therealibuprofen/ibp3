@@ -59,6 +59,7 @@ class WithinSessionConfig:
     max_timepoints: int | None = None
     min_trials_per_timepoint: int = 8
     n_jobs: int = 1
+    fallback_to_loo_on_small_class: bool = False
 
 
 VALID_DECODING_MODES = {"fixed_memory_3frames", "dynamic_time_window"}
@@ -767,6 +768,15 @@ def _make_cv_splits(y: np.ndarray, config: WithinSessionConfig) -> list[tuple[np
             raise ValueError("No class labels available for CV.")
         k = min(config.n_splits, int(positive_counts.min()))
         if k < 2:
+            if config.fallback_to_loo_on_small_class:
+                LOGGER.warning(
+                    "Smallest combined-direction class has %d sample; falling back from "
+                    "stratified %d-fold CV to leave-one-out CV.",
+                    int(positive_counts.min()),
+                    config.n_splits,
+                )
+                cv = sklearn_model_selection.LeaveOneOut()
+                return list(cv.split(np.arange(n)))
             raise ValueError(
                 f"Cannot run stratified {config.n_splits}-fold CV; smallest class has {positive_counts.min()} sample."
             )
@@ -1456,6 +1466,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--n-permutations", type=int, default=100_000)
     parser.add_argument("--max-timepoints", type=int, default=None)
+    parser.add_argument(
+        "--fallback-to-loo-on-small-class",
+        action="store_true",
+        help="If stratified k-fold is impossible because a class has one sample, use leave-one-out CV.",
+    )
     parser.add_argument("--no-motion-correction", action="store_true")
     parser.add_argument("--no-detrend", action="store_true")
     parser.add_argument("--no-spatial-filter", action="store_true")
@@ -1469,6 +1484,7 @@ def main(argv: list[str] | None = None) -> int:
         n_permutations=args.n_permutations,
         output_dir=args.output_dir,
         max_timepoints=args.max_timepoints,
+        fallback_to_loo_on_small_class=args.fallback_to_loo_on_small_class,
         apply_motion_correction=not args.no_motion_correction,
         detrend_window=0 if args.no_detrend else WithinSessionConfig.detrend_window,
         spatial_filter_radius=0 if args.no_spatial_filter else WithinSessionConfig.spatial_filter_radius,

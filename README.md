@@ -76,6 +76,25 @@ Optional filters:
 --sessions S27
 ```
 
+If a long batch run is interrupted or a few sessions fail because one
+direction class has only one valid sample, rerun with:
+
+```bash
+.venv/bin/python run_batch_within_session_decoding.py \
+  --data-root /data2/yuq1ngr/dataset/data2 \
+  --doppler-dir /data2/yuq1ngr/dataset/data2/doppler \
+  --project-record /data2/yuq1ngr/dataset/data2/ProjectRecord_paper.json \
+  --output-dir /data2/yuq1ngr/dataset/data2/output/python_within_session_batch \
+  --cv-scheme kfold \
+  --n-permutations 100000 \
+  --skip-existing \
+  --fallback-to-loo-on-small-class
+```
+
+`--skip-existing` reuses finished session JSON files in the output directory.
+`--fallback-to-loo-on-small-class` switches only the underrepresented sessions
+from stratified k-fold to leave-one-out CV.
+
 ## Notes
 
 - Input files are MATLAB v7.3 task-aligned `doppler_S*_R*+normcorre.mat`
