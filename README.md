@@ -89,6 +89,19 @@ MPLCONFIGDIR=/tmp/ppc_matplotlib_cache .venv/bin/python run_batch_within_session
   --n-permutations 100000
 ```
 
+To diagnose the failed sessions without training the decoder:
+
+```bash
+MPLCONFIGDIR=/tmp/ppc_matplotlib_cache python run_batch_within_session_decoding.py \
+  --data-root /data2/yuq1ngr/dataset/data2 \
+  --doppler-dir /data2/yuq1ngr/dataset/data2/doppler \
+  --project-record /data2/yuq1ngr/dataset/data2/ProjectRecord_paper.json \
+  --output-dir /data2/yuq1ngr/ibp3/output/python_within_session_batch_failed_diagnostics \
+  --rerun-failed-from-summary /data2/yuq1ngr/ibp3/output/python_within_session_batch/batch_summary.csv \
+  --cv-scheme kfold \
+  --diagnostic-only
+```
+
 ## Notes
 
 - Input files are MATLAB v7.3 task-aligned `doppler_S*_R*+normcorre.mat`

@@ -152,6 +152,24 @@ def _summary_row(
         "mat_path": str(mat_path),
         "output_dir": str(output_dir),
         "n_valid_trials": "",
+        "n_trials_total": "",
+        "n_valid_trials_after_success_and_targetPos": "",
+        "n_trials_entering_CV": "",
+        "skip_reason": "",
+        "min_class_count": "",
+        "requested_n_splits": "",
+        "actual_n_splits": "",
+        "center_tolerance": "",
+        "combined_label_distribution": "",
+        "horizontal_label_distribution": "",
+        "vertical_label_distribution": "",
+        "combined_labels_with_count_1": "",
+        "has_real_center_center_label_5": "",
+        "target_pos_near_zero_nonzero_x": "",
+        "target_pos_near_zero_nonzero_y": "",
+        "target_pos_near_zero_nonzero_x_count": "",
+        "target_pos_near_zero_nonzero_y_count": "",
+        "target_pos_distribution_round6": "",
         "accuracy": "",
         "balanced_accuracy": "",
         "final_accuracy_percent": "",
@@ -165,6 +183,32 @@ def _summary_row(
         row.update(
             {
                 "n_valid_trials": summary.get("n_valid_trials", ""),
+                "n_trials_total": summary.get("n_trials_total", ""),
+                "n_valid_trials_after_success_and_targetPos": summary.get(
+                    "n_valid_trials_after_success_and_targetPos", ""
+                ),
+                "n_trials_entering_CV": summary.get("n_trials_entering_CV", ""),
+                "skip_reason": summary.get("skip_reason", ""),
+                "min_class_count": summary.get("min_class_count", ""),
+                "requested_n_splits": summary.get("requested_n_splits", ""),
+                "actual_n_splits": summary.get("actual_n_splits", ""),
+                "center_tolerance": summary.get("center_tolerance", ""),
+                "combined_label_distribution": json.dumps(
+                    summary.get("combined_label_distribution", summary.get("class_distribution_combined", ""))
+                ),
+                "horizontal_label_distribution": json.dumps(summary.get("horizontal_label_distribution", "")),
+                "vertical_label_distribution": json.dumps(summary.get("vertical_label_distribution", "")),
+                "combined_labels_with_count_1": json.dumps(summary.get("combined_labels_with_count_1", "")),
+                "has_real_center_center_label_5": summary.get("has_real_center_center_label_5", ""),
+                "target_pos_near_zero_nonzero_x": summary.get("target_pos_near_zero_nonzero_x", ""),
+                "target_pos_near_zero_nonzero_y": summary.get("target_pos_near_zero_nonzero_y", ""),
+                "target_pos_near_zero_nonzero_x_count": summary.get(
+                    "target_pos_near_zero_nonzero_x_count", ""
+                ),
+                "target_pos_near_zero_nonzero_y_count": summary.get(
+                    "target_pos_near_zero_nonzero_y_count", ""
+                ),
+                "target_pos_distribution_round6": json.dumps(summary.get("target_pos_distribution_round6", "")),
                 "accuracy": summary.get("accuracy", ""),
                 "balanced_accuracy": summary.get("balanced_accuracy", ""),
                 "final_accuracy_percent": summary.get("final_accuracy_percent", ""),
@@ -245,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--n-permutations", type=int, default=100_000)
     parser.add_argument("--max-timepoints", type=int, default=None)
+    parser.add_argument("--center-tolerance", type=float, default=WithinSessionConfig.center_tolerance)
+    parser.add_argument("--diagnostic-only", action="store_true")
     parser.add_argument("--no-motion-correction", action="store_true")
     parser.add_argument("--no-detrend", action="store_true")
     parser.add_argument("--no-spatial-filter", action="store_true")
@@ -270,6 +316,8 @@ def main(argv: list[str] | None = None) -> int:
         n_permutations=args.n_permutations,
         output_dir=str(output_dir),
         max_timepoints=args.max_timepoints,
+        center_tolerance=args.center_tolerance,
+        diagnostic_only=args.diagnostic_only,
         apply_motion_correction=not args.no_motion_correction,
         detrend_window=0 if args.no_detrend else WithinSessionConfig.detrend_window,
         spatial_filter_radius=0 if args.no_spatial_filter else WithinSessionConfig.spatial_filter_radius,
@@ -318,9 +366,12 @@ def main(argv: list[str] | None = None) -> int:
         session_config = WithinSessionConfig(**{**asdict(config), "output_dir": str(session_output_dir)})
         try:
             result = decode_within_session(mat_path, session_config, session_id=token)
+            result_status = result["summary"].get("status", "ok")
+            if result_status == "diagnostic_only":
+                result_status = "skipped"
             rows.append(
                 _summary_row(
-                    status="ok",
+                    status=result_status,
                     record=record,
                     mat_path=mat_path,
                     output_dir=session_output_dir,

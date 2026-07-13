@@ -59,6 +59,8 @@ class WithinSessionConfig:
     max_timepoints: int | None = None
     min_trials_per_timepoint: int = 8
     n_jobs: int = 1
+    center_tolerance: float = 1e-6
+    diagnostic_only: bool = False
 
 
 VALID_DECODING_MODES = {"fixed_memory_3frames", "dynamic_time_window"}
@@ -585,7 +587,7 @@ def _save_intermediate(output_dir: Path, filename: str, array: np.ndarray) -> No
     np.save(output_dir / filename, array)
 
 
-def make_multicoder_labels(target_pos: np.ndarray) -> dict[str, Any]:
+def make_multicoder_labels(target_pos: np.ndarray, center_tolerance: float = 1e-6) -> dict[str, Any]:
     """Create horizontal/vertical multicoder labels from target positions.
 
     Horizontal and vertical labels match the MATLAB implementation:
@@ -598,9 +600,10 @@ def make_multicoder_labels(target_pos: np.ndarray) -> dict[str, Any]:
     target_pos = np.asarray(target_pos, dtype=float)
     labels = np.full((target_pos.shape[0], 2), np.nan, dtype=float)
     for dim in range(2):
-        labels[target_pos[:, dim] < 0, dim] = 1
-        labels[target_pos[:, dim] == 0, dim] = 2
-        labels[target_pos[:, dim] > 0, dim] = 3
+        values = target_pos[:, dim]
+        labels[values < -center_tolerance, dim] = 1
+        labels[np.abs(values) <= center_tolerance, dim] = 2
+        labels[values > center_tolerance, dim] = 3
     combined = labels[:, 0] + 3 * (labels[:, 1] - 1)
 
     angles_deg = np.degrees(np.arctan2(target_pos[:, 1], target_pos[:, 0]))
@@ -638,6 +641,79 @@ def make_multicoder_labels(target_pos: np.ndarray) -> dict[str, Any]:
         "target_angles_deg": angles_deg,
         "combined_to_angle_deg": combined_to_angle,
         "combined_label_names": label_names,
+        "center_tolerance": float(center_tolerance),
+    }
+
+
+def _distribution_dict(values: np.ndarray) -> dict[str, int]:
+    values = np.asarray(values)
+    values = values[values >= 0]
+    if values.size == 0:
+        return {}
+    unique, counts = np.unique(values.astype(int), return_counts=True)
+    return {str(int(k)): int(v) for k, v in zip(unique, counts)}
+
+
+def _target_pos_distribution(target_pos: np.ndarray, decimals: int = 6) -> list[dict[str, Any]]:
+    target_pos = np.asarray(target_pos, dtype=float)
+    finite = np.all(np.isfinite(target_pos), axis=1)
+    rounded = np.round(target_pos[finite], decimals=decimals)
+    if rounded.size == 0:
+        return []
+    unique, counts = np.unique(rounded, axis=0, return_counts=True)
+    return [
+        {"target_pos": [float(row[0]), float(row[1])], "count": int(count)}
+        for row, count in zip(unique, counts)
+    ]
+
+
+def _build_trial_label_diagnostics(
+    *,
+    aligned: AlignedSession,
+    labels: dict[str, Any],
+    valid_mask: np.ndarray,
+    trial_indices: np.ndarray,
+    requested_n_splits: int,
+    cv_scheme: str,
+    center_tolerance: float,
+) -> dict[str, Any]:
+    target_pos = aligned.target_pos[trial_indices]
+    axis_labels = labels["axis_labels"][trial_indices]
+    combined = labels["combined_labels"][trial_indices]
+    combined_distribution = _distribution_dict(combined)
+    singleton_labels = sorted(
+        int(label) for label, count in combined_distribution.items() if int(count) == 1
+    )
+    positive_counts = [int(v) for v in combined_distribution.values() if int(v) > 0]
+    min_class_count = min(positive_counts) if positive_counts else 0
+    if cv_scheme.lower() in {"kfold", "10fold", "stratifiedkfold"}:
+        actual_n_splits = min(requested_n_splits, min_class_count) if min_class_count >= 2 else 0
+    elif cv_scheme.lower() in {"loo", "leaveoneout", "leave-one-out"}:
+        actual_n_splits = int(trial_indices.size)
+    else:
+        actual_n_splits = 0
+
+    near_zero_x = np.isfinite(target_pos[:, 0]) & (np.abs(target_pos[:, 0]) < center_tolerance) & (target_pos[:, 0] != 0)
+    near_zero_y = np.isfinite(target_pos[:, 1]) & (np.abs(target_pos[:, 1]) < center_tolerance) & (target_pos[:, 1] != 0)
+
+    return {
+        "n_trials_total": int(aligned.images.shape[3]),
+        "n_valid_trials_after_success_and_targetPos": int(valid_mask.sum()),
+        "n_trials_entering_CV": int(trial_indices.size),
+        "target_pos_distribution_round6": _target_pos_distribution(target_pos, decimals=6),
+        "target_pos_near_zero_nonzero_x": bool(np.any(near_zero_x)),
+        "target_pos_near_zero_nonzero_y": bool(np.any(near_zero_y)),
+        "target_pos_near_zero_nonzero_x_count": int(np.sum(near_zero_x)),
+        "target_pos_near_zero_nonzero_y_count": int(np.sum(near_zero_y)),
+        "horizontal_label_distribution": _distribution_dict(axis_labels[:, 0]),
+        "vertical_label_distribution": _distribution_dict(axis_labels[:, 1]),
+        "combined_label_distribution": combined_distribution,
+        "combined_labels_with_count_1": singleton_labels,
+        "has_real_center_center_label_5": bool(combined_distribution.get("5", 0) > 0),
+        "min_class_count": int(min_class_count),
+        "requested_n_splits": int(requested_n_splits),
+        "actual_n_splits": int(actual_n_splits),
+        "center_tolerance": float(center_tolerance),
     }
 
 
@@ -874,6 +950,7 @@ def decode_timepoint(
         "predictions_combined": predictions.astype(int),
         "actual_combined": y,
         "fold_results": fold_results,
+        "actual_n_splits": int(len(splits)),
         "percent_correct": percent_correct,
         "n_correct": n_correct,
         "n_counted": int(y.size),
@@ -1041,7 +1118,7 @@ def decode_within_session(
         aligned.images, config, source_path=str(mat_path), output_dir=output_dir
     )
 
-    labels = make_multicoder_labels(aligned.target_pos)
+    labels = make_multicoder_labels(aligned.target_pos, center_tolerance=config.center_tolerance)
     valid_mask = aligned.valid_trial_mask.copy()
     axis_labels_all = labels["axis_labels"]
     combined_all = labels["combined_labels"]
@@ -1051,6 +1128,7 @@ def decode_within_session(
         n_time = min(n_time, config.max_timepoints)
 
     timepoint_results = []
+    diagnostic_results = []
     all_acc_p = []
     all_ang_p = []
     if config.mode == "fixed_memory_3frames":
@@ -1080,8 +1158,53 @@ def decode_within_session(
 
         axis_labels = axis_labels_all[trial_indices]
         combined = combined_all[trial_indices]
+        diagnostics = _build_trial_label_diagnostics(
+            aligned=aligned,
+            labels=labels,
+            valid_mask=valid_mask,
+            trial_indices=trial_indices,
+            requested_n_splits=config.n_splits,
+            cv_scheme=config.cv_scheme,
+            center_tolerance=config.center_tolerance,
+        )
+        diagnostics.update(
+            {
+                "mode": window_mode,
+                "eval_index": int(result_index),
+                "frame_indices": winfo["frame_indices"],
+                "n_window_frames": winfo["n_window_frames"],
+                "n_voxels": winfo["n_voxels"],
+                "feature_dim": winfo["feature_dim"],
+            }
+        )
+        diagnostic_results.append(diagnostics)
+        LOGGER.info(
+            "label diagnostics t=%d trials total=%d valid=%d cv=%d min_class=%d "
+            "actual_splits=%d combined=%s singletons=%s center5=%s near0=(x:%s,y:%s)",
+            result_index,
+            diagnostics["n_trials_total"],
+            diagnostics["n_valid_trials_after_success_and_targetPos"],
+            diagnostics["n_trials_entering_CV"],
+            diagnostics["min_class_count"],
+            diagnostics["actual_n_splits"],
+            json.dumps(diagnostics["combined_label_distribution"], sort_keys=True),
+            diagnostics["combined_labels_with_count_1"],
+            diagnostics["has_real_center_center_label_5"],
+            diagnostics["target_pos_near_zero_nonzero_x"],
+            diagnostics["target_pos_near_zero_nonzero_y"],
+        )
+
+        if config.diagnostic_only:
+            continue
         if len(np.unique(combined)) < 2:
             LOGGER.warning("Skipping timepoint %d: fewer than 2 classes", result_index)
+            continue
+        if diagnostics["min_class_count"] < 2:
+            LOGGER.warning(
+                "Skipping timepoint %d: insufficient class count; combined labels with count 1: %s",
+                result_index,
+                diagnostics["combined_labels_with_count_1"],
+            )
             continue
 
         decoded = decode_timepoint(x, axis_labels, combined, config)
@@ -1125,6 +1248,9 @@ def decode_within_session(
                 aligned.metadata.get("go_cue_s_relative_to_cue"),
             ),
             "cv_scheme": config.cv_scheme,
+            "requested_n_splits": int(config.n_splits),
+            "actual_n_splits": int(decoded["actual_n_splits"]),
+            "label_diagnostics": diagnostics,
             "accuracy": accuracy,
             "balanced_accuracy": balanced_accuracy,
             "percent_correct": decoded["percent_correct"],
@@ -1159,7 +1285,60 @@ def decode_within_session(
         )
 
     if not timepoint_results:
-        raise RuntimeError("No decodable timepoints were produced. Check trial labels and data completeness.")
+        final_diag = diagnostic_results[-1] if diagnostic_results else {}
+        skip_reason = "diagnostic_only" if config.diagnostic_only else "insufficient_class_count"
+        if final_diag and final_diag.get("min_class_count", 0) >= 2 and not config.diagnostic_only:
+            skip_reason = "no_decodable_timepoints"
+        summary = {
+            "status": "diagnostic_only" if config.diagnostic_only else "skipped",
+            "skip_reason": skip_reason,
+            "session_id": aligned.session_id,
+            "source_path": str(mat_path),
+            "n_trials_total": int(images.shape[3]),
+            "n_valid_trials": int(valid_mask.sum()),
+            "n_valid_trials_after_success_and_targetPos": int(valid_mask.sum()),
+            "n_trials_entering_CV": final_diag.get("n_trials_entering_CV", ""),
+            "mode": config.mode,
+            "cv_scheme": config.cv_scheme,
+            "requested_n_splits": int(config.n_splits),
+            "actual_n_splits": final_diag.get("actual_n_splits", ""),
+            "min_class_count": final_diag.get("min_class_count", ""),
+            "center_tolerance": float(config.center_tolerance),
+            "frame_rate_hz": float(aligned.frame_rate_hz),
+            "frame_rate_source": aligned.metadata.get("frame_rate_source"),
+            "recording_system": aligned.metadata.get("recording_system"),
+            "class_distribution_combined": final_diag.get("combined_label_distribution", {}),
+            "combined_label_distribution": final_diag.get("combined_label_distribution", {}),
+            "horizontal_label_distribution": final_diag.get("horizontal_label_distribution", {}),
+            "vertical_label_distribution": final_diag.get("vertical_label_distribution", {}),
+            "combined_labels_with_count_1": final_diag.get("combined_labels_with_count_1", []),
+            "has_real_center_center_label_5": final_diag.get("has_real_center_center_label_5", False),
+            "target_pos_near_zero_nonzero_x": final_diag.get("target_pos_near_zero_nonzero_x", False),
+            "target_pos_near_zero_nonzero_y": final_diag.get("target_pos_near_zero_nonzero_y", False),
+            "target_pos_near_zero_nonzero_x_count": final_diag.get("target_pos_near_zero_nonzero_x_count", 0),
+            "target_pos_near_zero_nonzero_y_count": final_diag.get("target_pos_near_zero_nonzero_y_count", 0),
+            "target_pos_distribution_round6": final_diag.get("target_pos_distribution_round6", []),
+        }
+        result_dict = {
+            "summary": summary,
+            "config": asdict(config),
+            "preprocess_log": preprocess_log,
+            "alignment_metadata": aligned.metadata,
+            "direction_labels": {
+                "combined_to_angle_deg": labels["combined_to_angle_deg"],
+                "combined_label_names": labels["combined_label_names"],
+                "center_tolerance": float(config.center_tolerance),
+                "center_center_rule": (
+                    "Multicoder center-center predictions are retained and assigned "
+                    "180 deg angular error, matching the existing MATLAB evaluation."
+                ),
+            },
+            "diagnostics": diagnostic_results,
+            "timepoints": [],
+        }
+        save_results(result_dict, output_dir, aligned.session_id)
+        print_summary(summary)
+        return result_dict
 
     acc_p_corr, acc_sig = apply_bonferroni_correction(np.asarray(all_acc_p), config.alpha)
     ang_p_corr, ang_sig = apply_bonferroni_correction(np.asarray(all_ang_p), config.alpha)
@@ -1180,8 +1359,14 @@ def decode_within_session(
         "source_path": str(mat_path),
         "n_trials_total": int(images.shape[3]),
         "n_valid_trials": int(valid_mask.sum()),
+        "n_valid_trials_after_success_and_targetPos": int(valid_mask.sum()),
+        "n_trials_entering_CV": int(final["n_trials"]),
         "mode": config.mode,
         "cv_scheme": config.cv_scheme,
+        "requested_n_splits": int(config.n_splits),
+        "actual_n_splits": int(final["actual_n_splits"]),
+        "min_class_count": int(final["label_diagnostics"]["min_class_count"]),
+        "center_tolerance": float(config.center_tolerance),
         "frame_rate_hz": float(aligned.frame_rate_hz),
         "frame_rate_source": aligned.metadata.get("frame_rate_source"),
         "recording_system": aligned.metadata.get("recording_system"),
@@ -1196,6 +1381,16 @@ def decode_within_session(
         ),
         "pca_component_range": [int(pca_all.min()), int(pca_all.max())],
         "class_distribution_combined": class_distribution,
+        "combined_label_distribution": final["label_diagnostics"]["combined_label_distribution"],
+        "horizontal_label_distribution": final["label_diagnostics"]["horizontal_label_distribution"],
+        "vertical_label_distribution": final["label_diagnostics"]["vertical_label_distribution"],
+        "combined_labels_with_count_1": final["label_diagnostics"]["combined_labels_with_count_1"],
+        "has_real_center_center_label_5": final["label_diagnostics"]["has_real_center_center_label_5"],
+        "target_pos_near_zero_nonzero_x": final["label_diagnostics"]["target_pos_near_zero_nonzero_x"],
+        "target_pos_near_zero_nonzero_y": final["label_diagnostics"]["target_pos_near_zero_nonzero_y"],
+        "target_pos_near_zero_nonzero_x_count": final["label_diagnostics"]["target_pos_near_zero_nonzero_x_count"],
+        "target_pos_near_zero_nonzero_y_count": final["label_diagnostics"]["target_pos_near_zero_nonzero_y_count"],
+        "target_pos_distribution_round6": final["label_diagnostics"]["target_pos_distribution_round6"],
     }
     result_dict = {
         "summary": summary,
@@ -1205,11 +1400,13 @@ def decode_within_session(
         "direction_labels": {
             "combined_to_angle_deg": labels["combined_to_angle_deg"],
             "combined_label_names": labels["combined_label_names"],
+            "center_tolerance": float(config.center_tolerance),
             "center_center_rule": (
                 "Multicoder center-center predictions are retained and assigned "
                 "180 deg angular error, matching the existing MATLAB evaluation."
             ),
         },
+        "diagnostics": diagnostic_results,
         "timepoints": timepoint_results,
     }
 
@@ -1238,6 +1435,47 @@ def save_results(result: dict[str, Any], output_dir: Path, session_id: str) -> N
     json_path = output_dir / f"{session_id}_within_session_decoding.json"
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(_to_jsonable(result), f, indent=2)
+
+    if not result["timepoints"]:
+        summary_path = output_dir / "summary.csv"
+        summary_fields = [
+            "session_id",
+            "source_path",
+            "status",
+            "skip_reason",
+            "mode",
+            "cv_scheme",
+            "requested_n_splits",
+            "actual_n_splits",
+            "min_class_count",
+            "center_tolerance",
+            "n_trials_total",
+            "n_valid_trials_after_success_and_targetPos",
+            "n_trials_entering_CV",
+            "combined_label_distribution",
+            "horizontal_label_distribution",
+            "vertical_label_distribution",
+            "combined_labels_with_count_1",
+            "has_real_center_center_label_5",
+            "target_pos_near_zero_nonzero_x",
+            "target_pos_near_zero_nonzero_y",
+            "target_pos_near_zero_nonzero_x_count",
+            "target_pos_near_zero_nonzero_y_count",
+            "target_pos_distribution_round6",
+        ]
+        summary = result["summary"]
+        summary_row = {
+            field: json.dumps(_to_jsonable(summary[field]))
+            if isinstance(summary.get(field), (dict, list))
+            else summary.get(field, "")
+            for field in summary_fields
+        }
+        with summary_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=summary_fields)
+            writer.writeheader()
+            writer.writerow(summary_row)
+        LOGGER.info("Saved %s and %s", json_path, summary_path)
+        return
 
     npz_path = output_dir / f"{session_id}_within_session_decoding_arrays.npz"
     np.savez_compressed(
@@ -1358,6 +1596,9 @@ def _plot_direction_confusion_matrix(
 def plot_within_session_results(result: dict[str, Any], output_dir: str | Path) -> None:
     """Generate performance, confusion, and diagnostic plots."""
 
+    if not result["timepoints"]:
+        return
+
     plt = _require("matplotlib.pyplot", "matplotlib")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1427,10 +1668,23 @@ def plot_within_session_results(result: dict[str, Any], output_dir: str | Path) 
 def print_summary(summary: dict[str, Any]) -> None:
     print("\nWithin-session decoding summary")
     print(f"  session id: {summary['session_id']}")
+    print(f"  status: {summary.get('status', 'ok')}")
+    if summary.get("skip_reason"):
+        print(f"  skip reason: {summary['skip_reason']}")
     print(f"  valid trials: {summary['n_valid_trials']}")
+    if "n_trials_entering_CV" in summary:
+        print(f"  trials entering CV: {summary['n_trials_entering_CV']}")
     print(f"  mode: {summary['mode']}")
     print(f"  CV scheme: {summary['cv_scheme']}")
+    if "actual_n_splits" in summary:
+        print(f"  requested/actual splits: {summary.get('requested_n_splits')} / {summary['actual_n_splits']}")
+    if "min_class_count" in summary:
+        print(f"  min class count: {summary['min_class_count']}")
+    if "combined_label_distribution" in summary:
+        print(f"  combined labels: {summary['combined_label_distribution']}")
     print(f"  frame rate: {summary['frame_rate_hz']} Hz ({summary['frame_rate_source']})")
+    if summary.get("status") in {"skipped", "diagnostic_only"}:
+        return
     print(f"  accuracy: {summary['accuracy']:.4f}")
     print(f"  balanced accuracy: {summary['balanced_accuracy']:.4f}")
     print(f"  final accuracy: {summary['final_accuracy_percent']:.2f}%")
@@ -1461,6 +1715,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--n-permutations", type=int, default=100_000)
     parser.add_argument("--max-timepoints", type=int, default=None)
+    parser.add_argument("--center-tolerance", type=float, default=WithinSessionConfig.center_tolerance)
+    parser.add_argument("--diagnostic-only", action="store_true")
     parser.add_argument("--no-motion-correction", action="store_true")
     parser.add_argument("--no-detrend", action="store_true")
     parser.add_argument("--no-spatial-filter", action="store_true")
@@ -1474,6 +1730,8 @@ def main(argv: list[str] | None = None) -> int:
         n_permutations=args.n_permutations,
         output_dir=args.output_dir,
         max_timepoints=args.max_timepoints,
+        center_tolerance=args.center_tolerance,
+        diagnostic_only=args.diagnostic_only,
         apply_motion_correction=not args.no_motion_correction,
         detrend_window=0 if args.no_detrend else WithinSessionConfig.detrend_window,
         spatial_filter_radius=0 if args.no_spatial_filter else WithinSessionConfig.spatial_filter_radius,
