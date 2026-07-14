@@ -41,10 +41,13 @@ class WithinSessionConfig:
     """Configuration for one within-session decoding run."""
 
     mode: str = "fixed_memory_3frames"
+    decoder_type: str | None = None
+    frame_rate_hz: float | None = None
     cv_scheme: str = "kfold"
     n_splits: int = 10
     random_seed: int = 12345
     variance_to_keep: float = 0.95
+    cpca_m: int = 1
     chance_accuracy: float = 1.0 / 8.0
     detrend_window: int = 50
     spatial_filter_radius: int = 2
@@ -64,6 +67,21 @@ class WithinSessionConfig:
 
 
 VALID_DECODING_MODES = {"fixed_memory_3frames", "dynamic_time_window"}
+VALID_DECODER_TYPES = {"multicoder_pca_lda", "pca_lda", "cpca_lda"}
+
+
+@dataclass
+class TaskConfig:
+    """Task settings inferred from project/session metadata."""
+
+    task_type: str
+    decoder_type: str
+    n_targets: int
+    chance_accuracy: float
+    frame_rate_hz: float
+    frame_rate_source: str
+    recording_system: str | None = None
+    project_record_path: str | None = None
 
 
 @dataclass
@@ -244,6 +262,119 @@ def _get_scalar(mapping: dict[str, Any], names: Iterable[str], default: float | 
     return default
 
 
+def _get_first_present(mapping: dict[str, Any], names: Iterable[str]) -> Any:
+    for name in names:
+        if name not in mapping:
+            continue
+        value = mapping[name]
+        if value is None:
+            continue
+        if isinstance(value, str) and value == "":
+            continue
+        return value
+    return None
+
+
+def _get_int(mapping: dict[str, Any], names: Iterable[str]) -> int | None:
+    value = _get_first_present(mapping, names)
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray):
+        value = value.reshape(-1)[0] if value.size else None
+    try:
+        if value is None or (isinstance(value, float) and not np.isfinite(value)):
+            return None
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def infer_task_config(
+    metadata: dict[str, Any],
+    *,
+    frame_rate_hz: float | None = None,
+    decoder_type: str | None = None,
+) -> TaskConfig:
+    """Infer task type, decoder, and frame rate from session metadata.
+
+    The function intentionally refuses to invent a generic 1 Hz fallback.
+    Frame rate must come from an explicit override/file field or from a
+    known ``RecordingSystem`` default.
+    """
+
+    n_targets = _get_int(metadata, ("nTargets", "n_targets", "NTargets"))
+    if n_targets == 8:
+        task_type = "8target"
+        default_decoder = "multicoder_pca_lda"
+        chance = 1.0 / 8.0
+    elif n_targets == 2:
+        task_type = "2target"
+        default_decoder = "cpca_lda"
+        chance = 1.0 / 2.0
+    else:
+        raise ValueError(
+            "Cannot infer task type: metadata must identify nTargets as 8 or 2. "
+            f"Found nTargets={n_targets!r}; metadata keys={sorted(metadata.keys())}."
+        )
+
+    selected_decoder = decoder_type or str(metadata.get("decoder_type") or default_decoder)
+    selected_decoder = selected_decoder.lower()
+    if selected_decoder not in VALID_DECODER_TYPES:
+        raise ValueError(
+            f"Unsupported decoder_type '{selected_decoder}'. Choose one of {sorted(VALID_DECODER_TYPES)}."
+        )
+    if task_type == "8target" and selected_decoder != "multicoder_pca_lda":
+        raise ValueError("8-target decoding currently requires decoder_type='multicoder_pca_lda'.")
+    if task_type == "2target" and selected_decoder not in {"pca_lda", "cpca_lda"}:
+        raise ValueError("2-target decoding requires decoder_type='cpca_lda' or 'pca_lda'.")
+
+    recording_system = _get_first_present(metadata, ("RecordingSystem", "recording_system"))
+    if isinstance(recording_system, np.ndarray):
+        recording_system = str(recording_system.reshape(-1)[0])
+    if recording_system is not None:
+        recording_system = str(recording_system)
+
+    source = "explicit"
+    rate = frame_rate_hz
+    if rate is None:
+        rate = _get_scalar(
+            metadata,
+            (
+                "frame_rate_hz",
+                "frameRateHz",
+                "framerate",
+                "frameRate",
+                "FrameRate",
+                "fs",
+            ),
+            default=None,
+        )
+        source = "file_or_metadata"
+    if not rate or rate <= 0:
+        recording_to_rate = {
+            "prototypeRT": 2.0,
+            "offlineVantage": 1.0,
+        }
+        rate = recording_to_rate.get(recording_system or "")
+        source = "ProjectRecord.RecordingSystem"
+    if not rate or rate <= 0:
+        raise ValueError(
+            "Cannot determine frame_rate_hz from file metadata, user config, or "
+            "RecordingSystem. Pass --frame-rate-hz explicitly for this dataset."
+        )
+
+    return TaskConfig(
+        task_type=task_type,
+        decoder_type=selected_decoder,
+        n_targets=int(n_targets),
+        chance_accuracy=chance,
+        frame_rate_hz=float(rate),
+        frame_rate_source=source,
+        recording_system=recording_system,
+        project_record_path=metadata.get("project_record_path"),
+    )
+
+
 def _unwrap_singleton(value: Any) -> Any:
     while isinstance(value, np.ndarray) and value.dtype == object and value.size == 1:
         value = value.reshape(-1, order="F")[0]
@@ -322,16 +453,24 @@ def _project_record_candidates(source_path: str) -> list[Path]:
     source = Path(source_path)
     candidates = []
     if source_path:
-        candidates.extend(
-            [
-                source.parent / "ProjectRecord_paper.json",
-                source.parent.parent / "ProjectRecord_paper.json",
-                source.parent.parent / "PPC_directional_tuning" / "Project Records" / "ProjectRecord_paper.json",
-            ]
+        for parent in [source.parent, source.parent.parent, source.parent.parent.parent]:
+            candidates.extend(
+                [
+                    parent / "ProjectRecord_paper.json",
+                    parent / "ProjectRecord.json",
+                    parent / "project_record.json",
+                    parent / "projectrecord.json",
+                    parent / "projectrecord",
+                ]
+            )
+        candidates.append(
+            source.parent.parent / "PPC_directional_tuning" / "Project Records" / "ProjectRecord_paper.json"
         )
     candidates.extend(
         [
             Path("data") / "ProjectRecord_paper.json",
+            Path("dataset") / "data1" / "project_record.json",
+            Path("dataset") / "data2" / "ProjectRecord_paper.json",
             Path("PPC_directional_tuning") / "Project Records" / "ProjectRecord_paper.json",
         ]
     )
@@ -345,15 +484,11 @@ def _project_record_candidates(source_path: str) -> list[Path]:
     return unique
 
 
-def _frame_rate_from_project_record(source_path: str) -> tuple[float | None, str | None, str | None]:
+def _project_record_metadata_from_path(source_path: str) -> tuple[dict[str, Any] | None, str | None]:
     session_run = _infer_session_run(source_path)
     if session_run is None:
-        return None, None, None
+        return None, None
     session_id, run_id = session_run
-    recording_to_rate = {
-        "prototypeRT": 2.0,
-        "offlineVantage": 1.0,
-    }
     for project_record in _project_record_candidates(source_path):
         if not project_record.exists():
             continue
@@ -363,10 +498,10 @@ def _frame_rate_from_project_record(source_path: str) -> tuple[float | None, str
             continue
         for row in rows:
             if int(row.get("Session", -1)) == session_id and int(row.get("Run", -1)) == run_id:
-                recording_system = row.get("RecordingSystem")
-                frame_rate = recording_to_rate.get(recording_system)
-                return frame_rate, recording_system, str(project_record)
-    return None, None, None
+                out = dict(row)
+                out["project_record_path"] = str(project_record)
+                return out, str(project_record)
+    return None, None
 
 
 def _median_finite(values: np.ndarray, name: str) -> float:
@@ -376,7 +511,120 @@ def _median_finite(values: np.ndarray, name: str) -> float:
     return float(np.median(finite))
 
 
-def align_fusi_and_behavior(session: dict[str, Any], session_id: str | None = None) -> AlignedSession:
+def _finite_unique_target_count(target_pos: np.ndarray, decimals: int = 6) -> int | None:
+    target_pos = np.asarray(target_pos, dtype=float)
+    finite = np.all(np.isfinite(target_pos), axis=1)
+    if not np.any(finite):
+        return None
+    unique = np.unique(np.round(target_pos[finite], decimals=decimals), axis=0)
+    return int(unique.shape[0])
+
+
+def _get_file_frame_rate(session: dict[str, Any]) -> tuple[float | None, str | None]:
+    core_params = session.get("coreParams", {})
+    if isinstance(core_params, dict):
+        rate = _get_scalar(core_params, ("framerate", "frameRate", "FrameRate", "fs"), default=None)
+        if rate and rate > 0:
+            return float(rate), "coreParams"
+    uf = session.get("UF", {})
+    if isinstance(uf, dict):
+        rate = _get_scalar(uf, ("FrameRate", "dopFrameRate", "frameRate", "framerate"), default=None)
+        if rate and rate > 0:
+            return float(rate), "UF"
+    return None, None
+
+
+def _build_trial_aligned_from_continuous(
+    session: dict[str, Any],
+    behavior: list[dict[str, Any]],
+    *,
+    frame_rate_hz: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Convert continuous ``dop[y, x, time]`` data into trial-aligned 4D images."""
+
+    if "dop" not in session or "timestamps" not in session:
+        raise KeyError("Continuous RT/BMI sessions require 'dop' and 'timestamps' fields.")
+
+    dop = np.asarray(session["dop"], dtype=np.float32)
+    timestamps = np.asarray(session["timestamps"], dtype=float).reshape(-1)
+    if dop.ndim != 3:
+        raise ValueError(f"Expected continuous dop shape [y, x, time], found {dop.shape}")
+    if dop.shape[2] != timestamps.size:
+        if dop.shape[0] == timestamps.size:
+            dop = np.transpose(dop, (1, 2, 0))
+        else:
+            raise ValueError(
+                f"Cannot match continuous dop shape {dop.shape} to timestamps length {timestamps.size}."
+            )
+
+    trial_start = _parse_time(behavior, "trialstart")
+    cue = _parse_time(behavior, "cue")
+    memory = _parse_time(behavior, "memory")
+    target_acquire = _parse_time(behavior, "target_acquire")
+    iti = _parse_time(behavior, "iti")
+
+    cue_reference = memory if np.isfinite(memory).any() else cue
+    end_rel = iti - trial_start
+    fallback_end_rel = target_acquire - trial_start
+    finite_end = end_rel[np.isfinite(end_rel) & (end_rel > 0)]
+    if finite_end.size == 0:
+        finite_end = fallback_end_rel[np.isfinite(fallback_end_rel) & (fallback_end_rel > 0)]
+    if finite_end.size == 0:
+        raise ValueError("Cannot trial-align continuous dop: no finite trial end timing fields.")
+
+    # Use a robust duration so occasional long/failed trials do not force a
+    # very large dense 4D array. The fixed-memory decoder only needs frames up
+    # to target acquisition; dynamic mode can still evaluate the common window.
+    duration_s = float(np.nanpercentile(finite_end, 90))
+    required_rel = target_acquire - trial_start
+    finite_required = required_rel[np.isfinite(required_rel) & (required_rel > 0)]
+    if finite_required.size:
+        duration_s = max(duration_s, float(np.nanpercentile(finite_required, 90)))
+    n_time = max(3, int(math.ceil(duration_s * frame_rate_hz)) + 1)
+
+    y, x, _ = dop.shape
+    images = np.empty((y, x, n_time, len(behavior)), dtype=np.float32)
+    sample_offsets = np.arange(n_time, dtype=float) / frame_rate_hz
+    tolerance_s = 0.75 / frame_rate_hz
+    missing = 0
+    for trial_id, start_s in enumerate(trial_start):
+        if not np.isfinite(start_s):
+            images[:, :, :, trial_id] = np.nan
+            missing += n_time
+            continue
+        sample_times = start_s + sample_offsets
+        right = np.searchsorted(timestamps, sample_times, side="left")
+        right = np.clip(right, 0, timestamps.size - 1)
+        left = np.maximum(right - 1, 0)
+        choose_left = np.abs(timestamps[left] - sample_times) <= np.abs(timestamps[right] - sample_times)
+        nearest = np.where(choose_left, left, right)
+        too_far = np.abs(timestamps[nearest] - sample_times) > tolerance_s
+        images[:, :, :, trial_id] = dop[:, :, nearest]
+        if np.any(too_far):
+            images[:, :, too_far, trial_id] = np.nan
+            missing += int(np.sum(too_far))
+
+    finite_cue_rel = cue_reference - trial_start
+    finite_cue_rel = finite_cue_rel[np.isfinite(finite_cue_rel) & (finite_cue_rel > 0)]
+    cue_index = int(round(_median_finite(finite_cue_rel, "cue/memory - trialstart") * frame_rate_hz))
+    cue_index = max(0, min(cue_index, n_time - 1))
+    return images, {
+        "continuous_source": True,
+        "continuous_trial_alignment": "nearest_timestamp_from_trialstart",
+        "continuous_missing_frame_count": int(missing),
+        "continuous_duration_s": duration_s,
+        "continuous_n_timepoints": int(n_time),
+        "continuous_cue_index": int(cue_index),
+    }
+
+
+def align_fusi_and_behavior(
+    session: dict[str, Any],
+    session_id: str | None = None,
+    *,
+    decoder_type: str | None = None,
+    frame_rate_hz: float | None = None,
+) -> AlignedSession:
     """Align task-aligned fUSI frames with behavior and construct trial labels.
 
     The distributed ``doppler_S*_R*+normcorre.mat`` files are already
@@ -387,53 +635,59 @@ def align_fusi_and_behavior(session: dict[str, Any], session_id: str | None = No
     Returns an ``AlignedSession`` with image shape ``[y, x, time, trial]``.
     """
 
-    if "iDop" not in session:
-        raise KeyError(f"Session is missing 'iDop'. Found fields: {sorted(session.keys())}")
     if "behavior" not in session:
         raise KeyError(f"Session is missing 'behavior'. Found fields: {sorted(session.keys())}")
 
-    images = np.asarray(session["iDop"], dtype=np.float32)
-    if images.ndim != 4:
-        raise ValueError(f"Expected iDop shape [y, x, time, trial], found {images.shape}")
-
     behavior = _mat_struct_array_to_list(session["behavior"])
-    if len(behavior) != images.shape[3]:
-        raise ValueError(
-            "Behavior/image trial mismatch. "
-            f"behavior has {len(behavior)} rows; iDop has {images.shape[3]} trials. "
-            "Use the existing MATLAB loader/metadata to provide task-aligned successful trials."
-        )
-
-    core_params = session.get("coreParams", {})
-    if not isinstance(core_params, dict):
-        core_params = {}
-    frame_rate_source = "coreParams"
-    recording_system = None
-    project_record_path = None
-    frame_rate = _get_scalar(core_params, ("framerate", "frameRate", "fs"), default=None)
-    if not frame_rate or frame_rate <= 0:
-        inferred_rate, recording_system, project_record_path = _frame_rate_from_project_record(
-            str(session.get("_source_path", ""))
-        )
-        if inferred_rate:
-            frame_rate = inferred_rate
-            frame_rate_source = "ProjectRecord.RecordingSystem"
-            LOGGER.info(
-                "Missing coreParams.framerate; inferred %.1f Hz from %s in %s",
-                frame_rate,
-                recording_system,
-                project_record_path,
-            )
-        else:
-            LOGGER.warning(
-                "Missing coreParams.framerate and no ProjectRecord match; using 1 Hz fallback."
-            )
-            frame_rate = 1.0
-            frame_rate_source = "fallback_1hz"
-
     success = _extract_success(behavior)
     target_pos = _extract_target_pos(behavior)
     valid = success & np.all(np.isfinite(target_pos), axis=1)
+
+    source_path = str(session.get("_source_path", ""))
+    project_record, project_record_path = _project_record_metadata_from_path(source_path)
+    metadata_for_inference: dict[str, Any] = dict(project_record or {})
+    metadata_for_inference["source_path"] = source_path
+    if project_record_path:
+        metadata_for_inference["project_record_path"] = project_record_path
+    if _get_int(metadata_for_inference, ("Session",)) is None:
+        sr = _infer_session_run(source_path)
+        if sr:
+            metadata_for_inference["Session"], metadata_for_inference["Run"] = sr
+    if _get_int(metadata_for_inference, ("nTargets",)) is None:
+        inferred_n_targets = _finite_unique_target_count(target_pos)
+        if inferred_n_targets is not None:
+            metadata_for_inference["nTargets"] = inferred_n_targets
+
+    file_rate, file_rate_source = _get_file_frame_rate(session)
+    explicit_rate = frame_rate_hz if frame_rate_hz is not None else file_rate
+    task_config = infer_task_config(
+        metadata_for_inference,
+        frame_rate_hz=explicit_rate,
+        decoder_type=decoder_type,
+    )
+    if frame_rate_hz is not None:
+        task_config.frame_rate_source = "user"
+    elif file_rate is not None:
+        task_config.frame_rate_source = file_rate_source or "file"
+    frame_rate = task_config.frame_rate_hz
+
+    continuous_log: dict[str, Any] = {}
+    if "iDop" in session:
+        images = np.asarray(session["iDop"], dtype=np.float32)
+        if images.ndim != 4:
+            raise ValueError(f"Expected iDop shape [y, x, time, trial], found {images.shape}")
+        if len(behavior) != images.shape[3]:
+            raise ValueError(
+                "Behavior/image trial mismatch. "
+                f"behavior has {len(behavior)} rows; iDop has {images.shape[3]} trials. "
+                "Use the existing MATLAB loader/metadata to provide task-aligned successful trials."
+            )
+    elif "dop" in session:
+        images, continuous_log = _build_trial_aligned_from_continuous(
+            session, behavior, frame_rate_hz=frame_rate
+        )
+    else:
+        raise KeyError(f"Session is missing 'iDop' or continuous 'dop'. Found fields: {sorted(session.keys())}")
 
     fixation_hold = _parse_time(behavior, "fixationhold")
     cue = _parse_time(behavior, "cue")
@@ -449,7 +703,10 @@ def align_fusi_and_behavior(session: dict[str, Any], session_id: str | None = No
 
     fixation_rel = fixation_hold - cue_reference
     fix_start_s = _median_finite(fixation_rel[valid], "fixationhold")
-    cue_index = int(math.ceil(abs(fix_start_s) * frame_rate))
+    if continuous_log.get("continuous_source"):
+        cue_index = int(continuous_log["continuous_cue_index"])
+    else:
+        cue_index = int(math.ceil(abs(fix_start_s) * frame_rate))
     cue_index = max(0, min(cue_index, images.shape[2] - 1))
 
     frame_index = np.arange(images.shape[2], dtype=float)
@@ -459,12 +716,18 @@ def align_fusi_and_behavior(session: dict[str, Any], session_id: str | None = No
     metadata = {
         "cue_reference": cue_name,
         "frame_rate_hz": float(frame_rate),
-        "frame_rate_source": frame_rate_source,
-        "recording_system": recording_system,
-        "project_record_path": project_record_path,
+        "frame_rate_source": task_config.frame_rate_source,
+        "recording_system": task_config.recording_system,
+        "project_record_path": task_config.project_record_path,
+        "task_type": task_config.task_type,
+        "decoder_type": task_config.decoder_type,
+        "n_targets": task_config.n_targets,
+        "task_config": asdict(task_config),
+        "project_record": project_record or {},
         "fix_start_s_relative_to_cue": fix_start_s,
         "go_cue_s_relative_to_cue": float(np.nanmedian(target_acquire - cue_reference)),
-        "source_path": session.get("_source_path", ""),
+        "source_path": source_path,
+        **continuous_log,
     }
     sid = session_id or _infer_session_id(session.get("_source_path", "session"))
     return AlignedSession(
@@ -491,12 +754,16 @@ def _infer_session_id(path_or_name: str) -> str:
 
 def _causal_moving_mean(data: np.ndarray, window: int) -> np.ndarray:
     flat = data.reshape((-1, data.shape[2] * data.shape[3]), order="F")
-    csum = np.cumsum(flat, axis=1, dtype=np.float64)
+    finite = np.isfinite(flat)
+    values = np.where(finite, flat, 0.0)
+    csum = np.cumsum(values, axis=1, dtype=np.float64)
+    ccount = np.cumsum(finite, axis=1, dtype=np.float64)
     out = np.empty_like(flat, dtype=np.float32)
     for t in range(flat.shape[1]):
         start = max(0, t - window)
         total = csum[:, t] - (csum[:, start - 1] if start > 0 else 0.0)
-        out[:, t] = total / (t - start + 1)
+        count = ccount[:, t] - (ccount[:, start - 1] if start > 0 else 0.0)
+        out[:, t] = np.divide(total, count, out=np.zeros(total.shape, dtype=np.float64), where=count > 0)
     return out.reshape(data.shape, order="F")
 
 
@@ -538,9 +805,12 @@ def preprocess_power_doppler_session(
     output_dir = Path(output_dir or config.output_dir)
 
     normcorre_present = "+normcorre" in str(source_path).lower()
+    rt_continuous_present = "rt_fus_data" in str(source_path).lower()
     if config.apply_motion_correction:
         if normcorre_present and config.assume_normcorre_if_present:
             log["motion_correction"] = "already_normcorre_from_source_file"
+        elif rt_continuous_present:
+            log["motion_correction"] = "rt_continuous_source_assumed_preprocessed"
         else:
             # The paper repository's implemented motion-correction backend is
             # MATLAB NoRMCorre rigid registration. Python re-running of
@@ -559,7 +829,8 @@ def preprocess_power_doppler_session(
 
     if config.detrend_window and config.detrend_window > 0:
         moving = _causal_moving_mean(out, config.detrend_window)
-        mean_per_voxel = out.reshape((-1, out.shape[2] * out.shape[3]), order="F").mean(axis=1)
+        mean_per_voxel = np.nanmean(out.reshape((-1, out.shape[2] * out.shape[3]), order="F"), axis=1)
+        mean_per_voxel = np.nan_to_num(mean_per_voxel, nan=0.0, posinf=0.0, neginf=0.0)
         mean_per_voxel = mean_per_voxel.reshape((out.shape[0], out.shape[1], 1, 1), order="F")
         out = out - moving + mean_per_voxel
         log["detrend_window"] = config.detrend_window
@@ -645,6 +916,51 @@ def make_multicoder_labels(target_pos: np.ndarray, center_tolerance: float = 1e-
     }
 
 
+def make_binary_labels(target_pos: np.ndarray, decimals: int = 6) -> dict[str, Any]:
+    """Encode exactly two unique target positions as labels 0 and 1."""
+
+    target_pos = np.asarray(target_pos, dtype=float)
+    finite = np.all(np.isfinite(target_pos), axis=1)
+    rounded = np.round(target_pos[finite], decimals=decimals)
+    unique = np.unique(rounded, axis=0) if rounded.size else np.empty((0, 2), dtype=float)
+    if unique.shape[0] != 2:
+        actual = unique.astype(float).tolist()
+        raise ValueError(
+            "2-target binary decoding requires exactly two unique finite target positions; "
+            f"found {unique.shape[0]}: {actual}"
+        )
+
+    labels = np.full(target_pos.shape[0], -1, dtype=int)
+    mapping: dict[int, list[float]] = {}
+    pos_to_label = {tuple(row.tolist()): i for i, row in enumerate(unique)}
+    for i, pos in enumerate(np.round(target_pos, decimals=decimals)):
+        if np.all(np.isfinite(pos)):
+            labels[i] = pos_to_label[tuple(pos.tolist())]
+    for pos, label in pos_to_label.items():
+        mapping[int(label)] = [float(pos[0]), float(pos[1])]
+
+    angles_deg = np.degrees(np.arctan2(target_pos[:, 1], target_pos[:, 0]))
+    angles_deg = np.mod(angles_deg, 360.0)
+    label_to_angle: dict[int, float] = {}
+    for label in sorted(mapping):
+        idx = labels == label
+        radians = np.deg2rad(angles_deg[idx])
+        mean_angle = math.degrees(math.atan2(np.sin(radians).mean(), np.cos(radians).mean()))
+        label_to_angle[int(label)] = float(mean_angle % 360.0)
+
+    message = f"Binary target position to label mapping: {json.dumps(mapping, sort_keys=True)}"
+    print(message)
+    LOGGER.info(message)
+    return {
+        "binary_labels": labels,
+        "target_angles_deg": angles_deg,
+        "label_to_target_pos": mapping,
+        "combined_to_angle_deg": label_to_angle,
+        "combined_label_names": {label: f"target_{label}" for label in mapping},
+        "round_decimals": int(decimals),
+    }
+
+
 def _distribution_dict(values: np.ndarray) -> dict[str, int]:
     values = np.asarray(values)
     values = values[values >= 0]
@@ -717,6 +1033,42 @@ def _build_trial_label_diagnostics(
     }
 
 
+def _build_binary_label_diagnostics(
+    *,
+    aligned: AlignedSession,
+    labels: dict[str, Any],
+    valid_mask: np.ndarray,
+    trial_indices: np.ndarray,
+    requested_n_splits: int,
+    cv_scheme: str,
+) -> dict[str, Any]:
+    target_pos = aligned.target_pos[trial_indices]
+    binary = labels["binary_labels"][trial_indices]
+    distribution = _distribution_dict(binary)
+    singleton_labels = sorted(int(label) for label, count in distribution.items() if int(count) == 1)
+    positive_counts = [int(v) for v in distribution.values() if int(v) > 0]
+    min_class_count = min(positive_counts) if positive_counts else 0
+    if cv_scheme.lower() in {"kfold", "10fold", "stratifiedkfold"}:
+        actual_n_splits = min(requested_n_splits, min_class_count) if min_class_count >= 2 else 0
+    elif cv_scheme.lower() in {"loo", "leaveoneout", "leave-one-out"}:
+        actual_n_splits = int(trial_indices.size)
+    else:
+        actual_n_splits = 0
+    return {
+        "n_trials_total": int(aligned.images.shape[3]),
+        "n_valid_trials_after_success_and_targetPos": int(valid_mask.sum()),
+        "n_trials_entering_CV": int(trial_indices.size),
+        "target_pos_distribution_round6": _target_pos_distribution(target_pos, decimals=6),
+        "binary_label_distribution": distribution,
+        "combined_label_distribution": distribution,
+        "combined_labels_with_count_1": singleton_labels,
+        "min_class_count": int(min_class_count),
+        "requested_n_splits": int(requested_n_splits),
+        "actual_n_splits": int(actual_n_splits),
+        "label_to_target_pos": labels["label_to_target_pos"],
+    }
+
+
 def build_dynamic_window_features(
     images: np.ndarray,
     eval_index: int,
@@ -740,17 +1092,17 @@ def build_dynamic_window_features(
         frame_indices = np.arange(cue_index, eval_index + 1)
 
     y, x, _, n_trials = images.shape
+    trial_ok = np.asarray(valid_trial_mask, dtype=bool).copy()
+    if trial_ok.size != n_trials:
+        raise ValueError(f"valid_trial_mask has {trial_ok.size} entries; images have {n_trials} trials.")
     if voxel_mask is None:
-        frame_finite = np.isfinite(images[:, :, frame_indices, :]).all(axis=(2, 3))
+        frame_finite = np.isfinite(images[:, :, frame_indices, :][:, :, :, trial_ok]).any(axis=(2, 3))
         voxel_mask = frame_finite
     voxel_mask = np.asarray(voxel_mask, dtype=bool)
     n_voxels = int(voxel_mask.sum())
     if n_voxels == 0:
         raise ValueError("No valid voxels remain after applying finite/background mask.")
 
-    trial_ok = np.asarray(valid_trial_mask, dtype=bool).copy()
-    if trial_ok.size != n_trials:
-        raise ValueError(f"valid_trial_mask has {trial_ok.size} entries; images have {n_trials} trials.")
     trial_indices = np.where(trial_ok)[0]
     features = np.empty((trial_indices.size, n_voxels * frame_indices.size), dtype=np.float32)
     for row, trial in enumerate(trial_indices):
@@ -799,16 +1151,16 @@ def build_fixed_memory_3frames_features(
     frame_indices = np.arange(start, memory_end_index, dtype=int)
 
     _, _, _, n_trials = images.shape
+    trial_ok = np.asarray(valid_trial_mask, dtype=bool).copy()
+    if trial_ok.size != n_trials:
+        raise ValueError(f"valid_trial_mask has {trial_ok.size} entries; images have {n_trials} trials.")
     if voxel_mask is None:
-        voxel_mask = np.isfinite(images[:, :, frame_indices, :]).all(axis=(2, 3))
+        voxel_mask = np.isfinite(images[:, :, frame_indices, :][:, :, :, trial_ok]).any(axis=(2, 3))
     voxel_mask = np.asarray(voxel_mask, dtype=bool)
     n_voxels = int(voxel_mask.sum())
     if n_voxels == 0:
         raise ValueError("No valid voxels remain after applying finite/background mask.")
 
-    trial_ok = np.asarray(valid_trial_mask, dtype=bool).copy()
-    if trial_ok.size != n_trials:
-        raise ValueError(f"valid_trial_mask has {trial_ok.size} entries; images have {n_trials} trials.")
     trial_indices = np.where(trial_ok)[0]
     features = np.empty((trial_indices.size, n_voxels * frame_indices.size), dtype=np.float32)
     for row, trial in enumerate(trial_indices):
@@ -897,6 +1249,328 @@ def fit_fold_scaler_pca_lda(
     return pred, int(pca.n_components_), zero_std_count
 
 
+def _zscore_train_test(x_train: np.ndarray, x_test: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
+    mu = x_train.mean(axis=0)
+    sigma = x_train.std(axis=0, ddof=0)
+    tiny = sigma < 1e-12
+    zero_std_count = int(tiny.sum())
+    sigma[tiny] = 1.0
+    z_train = (x_train - mu) / sigma
+    z_test = (x_test - mu) / sigma
+    z_train = np.nan_to_num(z_train, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+    z_test = np.nan_to_num(z_test, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+    return z_train, z_test, zero_std_count
+
+
+def _matlab_principal_components(data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return PCA coefficients/eigenvalues following ``dataproc_func_princomp``.
+
+    The MATLAB CPCA code uses the sample-space eigenproblem when features
+    outnumber observations, then maps those vectors back into feature space.
+    This mirrors that route so class-wise PCA keeps the same small-sample
+    behavior as ``PPC_directional_tuning/cbmspccode/dataproc_func_princomp.m``.
+    """
+
+    data = np.asarray(data, dtype=float)
+    if data.ndim != 2:
+        raise ValueError(f"Expected 2D data matrix, found shape {data.shape}.")
+    n_obs, n_features = data.shape
+    if n_obs < 2 or n_features == 0:
+        return np.empty((n_features, 0), dtype=float), np.empty(0, dtype=float)
+
+    demeaned = data - data.mean(axis=0, keepdims=True)
+    if n_features >= n_obs:
+        gram = demeaned @ demeaned.T
+        eval_raw, sample_vecs = np.linalg.eigh((gram + gram.T) / 2.0)
+        order = np.argsort(eval_raw)[::-1][: n_obs - 1]
+        eval_raw = eval_raw[order]
+        sample_vecs = sample_vecs[:, order]
+        tol = max(gram.shape) * np.finfo(float).eps * max(float(np.max(np.abs(eval_raw))), 1.0)
+        keep = eval_raw > tol
+        eval_raw = eval_raw[keep]
+        sample_vecs = sample_vecs[:, keep]
+        if eval_raw.size == 0:
+            return np.empty((n_features, 0), dtype=float), np.empty(0, dtype=float)
+        coeff = demeaned.T @ sample_vecs @ np.diag(eval_raw ** -0.5)
+        latent = eval_raw / (n_obs - 1)
+    else:
+        scatter = demeaned.T @ demeaned
+        eval_raw, coeff = np.linalg.eigh((scatter + scatter.T) / 2.0)
+        order = np.argsort(eval_raw)[::-1]
+        eval_raw = eval_raw[order]
+        coeff = coeff[:, order]
+        latent = eval_raw / (n_obs - 1)
+        tol = max(scatter.shape) * np.finfo(float).eps * max(float(np.max(np.abs(eval_raw))), 1.0)
+        keep = eval_raw > tol
+        coeff = coeff[:, keep]
+        latent = latent[keep]
+
+    return np.asarray(coeff, dtype=float), np.asarray(latent, dtype=float)
+
+
+def _select_cpca_pca_components(
+    coeff: np.ndarray,
+    latent: np.ndarray,
+    eval_keep: tuple[str, float | None] = ("mean", None),
+) -> np.ndarray:
+    """Apply the MATLAB CPCA ``EvalKeep`` rule to class-wise PCA output."""
+
+    if latent.size == 0 or coeff.shape[1] == 0:
+        return coeff[:, :0]
+
+    method, value = eval_keep
+    if method == "median":
+        keep = latent > np.median(latent)
+        return coeff[:, keep]
+    if method == "spectrum":
+        if latent.size == 1:
+            return coeff[:, :1]
+        return coeff[:, : int(np.argmax(np.abs(np.diff(latent)))) + 1]
+    if method == "energy":
+        if value is None:
+            raise ValueError("EvalKeep 'energy' requires a fraction value.")
+        cutoff = float(value) * float(np.sum(latent))
+        n_keep = int(np.searchsorted(np.cumsum(latent), cutoff, side="right") + 1)
+        return coeff[:, : min(n_keep, coeff.shape[1])]
+
+    return coeff[:, latent > np.mean(latent)]
+
+
+def _orth_columns(matrix: np.ndarray) -> np.ndarray:
+    """MATLAB ``orth`` equivalent for column spaces."""
+
+    matrix = np.asarray(matrix, dtype=float)
+    if matrix.size == 0:
+        return np.empty((matrix.shape[0], 0), dtype=float)
+    u, singular, _ = np.linalg.svd(matrix, full_matrices=False)
+    tol = max(matrix.shape) * np.finfo(float).eps * max(float(singular[0]) if singular.size else 0.0, 1.0)
+    return u[:, singular > tol]
+
+
+def _cov_matrix(data: np.ndarray, n_features: int | None = None) -> np.ndarray:
+    """Sample covariance with MATLAB-like zero covariance for singletons."""
+
+    data = np.asarray(data, dtype=float)
+    if data.ndim == 1:
+        data = data.reshape(-1, 1)
+    if n_features is None:
+        n_features = data.shape[1]
+    if data.shape[0] < 2:
+        return np.zeros((n_features, n_features), dtype=float)
+    cov = np.cov(data, rowvar=False, bias=False)
+    cov = np.asarray(cov, dtype=float)
+    if cov.ndim == 0:
+        cov = cov.reshape(1, 1)
+    return cov
+
+
+def _regularize_covariance(cov: np.ndarray) -> np.ndarray:
+    cov = np.asarray(cov, dtype=float)
+    if cov.size == 0:
+        return cov
+    scale = float(np.trace(cov) / cov.shape[0]) if cov.shape[0] else 1.0
+    if not np.isfinite(scale) or scale <= 0:
+        scale = 1.0
+    ridge = max(scale, 1.0) * 1e-9
+    return cov + np.eye(cov.shape[0]) * ridge
+
+
+def _linear_disc_analysis_matlab(train_data: np.ndarray, train_labels: np.ndarray, m: int) -> np.ndarray:
+    """Feature extraction matrix from ``linear_disc_analysis.m``."""
+
+    train_data = np.asarray(train_data, dtype=float)
+    train_labels = np.asarray(train_labels).reshape(-1)
+    n_obs, n_features = train_data.shape
+    classes = np.unique(train_labels)
+    n_classes = classes.size
+    if n_obs == 0 or n_features == 0 or n_classes < 2:
+        return np.empty((0, n_features), dtype=float)
+
+    mean = np.zeros(n_features, dtype=float)
+    sigma_w = np.zeros((n_features, n_features), dtype=float)
+    sigma_b_second_moment = np.zeros((n_features, n_features), dtype=float)
+    for cls in classes:
+        class_data = train_data[train_labels == cls]
+        prob = class_data.shape[0] / n_obs
+        mean_i = class_data.mean(axis=0)
+        sigma_i = _cov_matrix(class_data, n_features)
+        mean += prob * mean_i
+        sigma_w += prob * sigma_i
+        sigma_b_second_moment += prob * np.outer(mean_i, mean_i)
+
+    sigma_b = sigma_b_second_moment - np.outer(mean, mean)
+    sigma = sigma_w + sigma_b
+    m_new = min(int(np.linalg.matrix_rank(sigma_b)), int(n_classes - 1), int(m))
+    if m_new <= 0:
+        return np.empty((0, n_features), dtype=float)
+
+    mat = np.linalg.pinv(sigma) @ sigma_b
+    eigvals, eigvecs = np.linalg.eig(mat)
+    eigvals = np.real_if_close(eigvals, tol=1000).real
+    eigvecs = np.real_if_close(eigvecs, tol=1000).real
+    order = np.argsort(eigvals)[::-1]
+    return eigvecs[:, order[:m_new]].T
+
+
+def _fit_matlab_cpca_subspaces(z_train: np.ndarray, y_train: np.ndarray, *, m: int = 1) -> list[np.ndarray]:
+    """Fit class-wise CPCA subspaces using the MATLAB paper code's recipe."""
+
+    y_train = np.asarray(y_train).reshape(-1)
+    classes = np.unique(y_train)
+    if classes.size < 2:
+        raise ValueError("CPCA+LDA requires at least two classes in the training fold.")
+
+    n_obs, n_features = z_train.shape
+    class_counts = np.array([np.sum(y_train == cls) for cls in classes], dtype=float)
+    sample_means: list[np.ndarray] = []
+    class_pca_bases: list[np.ndarray] = []
+    for cls in classes:
+        class_data = z_train[y_train == cls]
+        sample_means.append(class_data.mean(axis=0))
+        coeff, latent = _matlab_principal_components(class_data)
+        class_pca_bases.append(_select_cpca_pca_components(coeff, latent, ("mean", None)))
+
+    overall_mean = z_train.mean(axis=0)
+    data_b = np.vstack(
+        [
+            math.sqrt(float(class_counts[i]) / float(n_obs)) * (sample_means[i] - overall_mean)
+            for i in range(classes.size)
+        ]
+    )
+    between_basis, _ = _matlab_principal_components(data_b)
+
+    subspaces: list[np.ndarray] = []
+    for class_basis in class_pca_bases:
+        temp_basis = _orth_columns(np.column_stack([class_basis, between_basis]))
+        train_projected = z_train @ temp_basis
+        dfe = _linear_disc_analysis_matlab(train_projected, y_train, m)
+        subspaces.append(temp_basis @ dfe.T)
+
+    empty = [subspace.shape[1] == 0 for subspace in subspaces]
+    if any(empty):
+        nonempty = next((subspace for subspace in subspaces if subspace.shape[1] > 0), None)
+        if nonempty is None:
+            coeff, _ = _matlab_principal_components(z_train)
+            nonempty = coeff[:, :1] if coeff.shape[1] else np.ones((n_features, 1), dtype=float)
+        subspaces = [nonempty.copy() if is_empty else subspace for subspace, is_empty in zip(subspaces, empty)]
+
+    return subspaces
+
+
+def _choose_cpca_subspaces(
+    z_test: np.ndarray,
+    z_train: np.ndarray,
+    y_train: np.ndarray,
+    subspaces: list[np.ndarray],
+    *,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Replicate ``choose_subspace(..., 'unbiased')`` for each test sample."""
+
+    classes = np.unique(y_train)
+    priors = np.full(classes.size, 1.0 / classes.size, dtype=float)
+    selected = np.empty(z_test.shape[0], dtype=int)
+
+    for row_idx, test_row in enumerate(z_test):
+        max_posteriors = np.empty(len(subspaces), dtype=float)
+        for subspace_idx, subspace in enumerate(subspaces):
+            test_feature = test_row @ subspace
+            train_features = z_train @ subspace
+            scores = np.empty(classes.size, dtype=float)
+            for class_idx, cls in enumerate(classes):
+                class_features = train_features[y_train == cls]
+                mu = class_features.mean(axis=0)
+                cov = _regularize_covariance(_cov_matrix(class_features, subspace.shape[1]))
+                delta = np.atleast_1d(test_feature - mu)
+                sign, logdet = np.linalg.slogdet(cov)
+                if sign <= 0 or not np.isfinite(logdet):
+                    cov = _regularize_covariance(cov)
+                    sign, logdet = np.linalg.slogdet(cov)
+                quad = float(delta @ np.linalg.pinv(cov) @ delta.T)
+                scores[class_idx] = -0.5 * quad - 0.5 * float(logdet) + math.log(float(priors[class_idx]))
+
+            divisor = float(np.max(scores))
+            scaled = scores / divisor if np.isfinite(divisor) and abs(divisor) > 1e-12 else scores
+            scaled = np.clip(scaled, -700.0, 700.0)
+            posterior = np.exp(scaled)
+            posterior = posterior / posterior.sum()
+            max_posteriors[subspace_idx] = float(np.max(posterior))
+
+        best = np.flatnonzero(np.isclose(max_posteriors, np.max(max_posteriors)))
+        selected[row_idx] = int(rng.choice(best))
+
+    return selected
+
+
+def _predict_matlab_cpca_lda(
+    z_train: np.ndarray,
+    y_train: np.ndarray,
+    z_test: np.ndarray,
+    *,
+    m: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+    """Fit MATLAB-style CPCA and classify through selected subspaces."""
+
+    sklearn_discriminant = _require("sklearn.discriminant_analysis", "scikit-learn")
+
+    y_train = np.asarray(y_train).reshape(-1)
+    subspaces = _fit_matlab_cpca_subspaces(z_train, y_train, m=m)
+    selected = _choose_cpca_subspaces(z_test, z_train, y_train, subspaces, rng=rng)
+    pred = np.empty(z_test.shape[0], dtype=int)
+
+    for subspace_idx in np.unique(selected):
+        mask = selected == subspace_idx
+        train_features = z_train @ subspaces[int(subspace_idx)]
+        test_features = z_test[mask] @ subspaces[int(subspace_idx)]
+        lda = sklearn_discriminant.LinearDiscriminantAnalysis(solver="svd")
+        lda.fit(train_features, y_train)
+        pred[mask] = lda.predict(test_features).astype(int)
+
+    return pred, subspaces, selected
+
+
+def fit_fold_scaler_projection_lda(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_test: np.ndarray,
+    *,
+    variance_to_keep: float,
+    decoder_type: str,
+    cpca_m: int = 1,
+    random_seed: int | None = None,
+) -> tuple[np.ndarray, int, int]:
+    """Fit train-fold z-score, PCA/cPCA, and binary LDA."""
+
+    sklearn_decomposition = _require("sklearn.decomposition", "scikit-learn")
+    sklearn_discriminant = _require("sklearn.discriminant_analysis", "scikit-learn")
+
+    z_train, z_test, zero_std_count = _zscore_train_test(x_train, x_test)
+    if decoder_type == "pca_lda":
+        projector = sklearn_decomposition.PCA(n_components=variance_to_keep, svd_solver="full")
+        train_scores = projector.fit_transform(z_train)
+        test_scores = projector.transform(z_test)
+        n_components = int(projector.n_components_)
+    elif decoder_type == "cpca_lda":
+        rng = np.random.default_rng(random_seed)
+        pred, subspaces, _selected = _predict_matlab_cpca_lda(
+            z_train,
+            y_train,
+            z_test,
+            m=cpca_m,
+            rng=rng,
+        )
+        n_components = int(max(subspace.shape[1] for subspace in subspaces))
+        return pred, n_components, zero_std_count
+    else:
+        raise ValueError("Binary timepoint decoding supports decoder_type='pca_lda' or 'cpca_lda'.")
+
+    lda = sklearn_discriminant.LinearDiscriminantAnalysis(solver="svd")
+    lda.fit(train_scores, y_train)
+    pred = lda.predict(test_scores).astype(int)
+    return pred, n_components, zero_std_count
+
+
 def decode_timepoint(
     x: np.ndarray,
     labels_axis: np.ndarray,
@@ -955,6 +1629,69 @@ def decode_timepoint(
         "n_correct": n_correct,
         "n_counted": int(y.size),
         "pca_components": np.asarray(pca_components, dtype=int),
+        "zero_std_feature_counts": np.asarray(zero_std_counts, dtype=int),
+    }
+
+
+def decode_timepoint_binary(
+    x: np.ndarray,
+    labels_binary: np.ndarray,
+    config: WithinSessionConfig,
+    *,
+    decoder_type: str,
+) -> dict[str, Any]:
+    y = labels_binary.astype(int)
+    splits = _make_cv_splits(y, config)
+    predictions = np.full_like(y, fill_value=-1)
+    fold_results = []
+    components = []
+    zero_std_counts = []
+
+    for fold_id, (train_idx, test_idx) in enumerate(splits):
+        pred, n_components, zero_std = fit_fold_scaler_projection_lda(
+            x[train_idx],
+            y[train_idx],
+            x[test_idx],
+            variance_to_keep=config.variance_to_keep,
+            decoder_type=decoder_type,
+            cpca_m=config.cpca_m,
+            random_seed=config.random_seed + fold_id,
+        )
+        predictions[test_idx] = pred
+        correct = pred == y[test_idx]
+        fold_results.append(
+            {
+                "fold": fold_id,
+                "n_train": int(train_idx.size),
+                "n_test": int(test_idx.size),
+                "percent_correct": float(correct.mean() * 100.0),
+                "test_indices_local": test_idx.astype(int).tolist(),
+                "predicted_binary": pred.astype(int).tolist(),
+                "actual_binary": y[test_idx].astype(int).tolist(),
+                "pca_components": n_components,
+                "zero_std_features": zero_std,
+                "decoder_type": decoder_type,
+            }
+        )
+        components.append(n_components)
+        zero_std_counts.append(zero_std)
+
+    if np.any(predictions < 0):
+        raise RuntimeError("Some samples did not receive a CV prediction.")
+
+    n_correct = int(np.sum(predictions == y))
+    percent_correct = float(n_correct / y.size * 100.0)
+    return {
+        "predictions_binary": predictions.astype(int),
+        "actual_binary": y,
+        "predictions_combined": predictions.astype(int),
+        "actual_combined": y,
+        "fold_results": fold_results,
+        "actual_n_splits": int(len(splits)),
+        "percent_correct": percent_correct,
+        "n_correct": n_correct,
+        "n_counted": int(y.size),
+        "pca_components": np.asarray(components, dtype=int),
         "zero_std_feature_counts": np.asarray(zero_std_counts, dtype=int),
     }
 
@@ -1019,8 +1756,8 @@ def permutation_test_angular_error(
     rng = np.random.default_rng(random_seed)
     actual_combined = np.asarray(actual_combined, dtype=int)
     possible = np.array(sorted(k for k in combined_to_angle_deg.keys() if k != 5), dtype=int)
-    if possible.size != 8:
-        LOGGER.warning("Expected 8 real target directions, found %d: %s", possible.size, possible.tolist())
+    if possible.size not in {2, 8}:
+        LOGGER.warning("Expected 2 or 8 real target directions, found %d: %s", possible.size, possible.tolist())
 
     actual_angles = np.array([combined_to_angle_deg[int(k)] for k in actual_combined], dtype=float)
     null_means = np.empty(n_permutations, dtype=np.float32)
@@ -1113,15 +1850,31 @@ def decode_within_session(
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     session = load_mat73_session(mat_path)
-    aligned = align_fusi_and_behavior(session, session_id=session_id)
+    aligned = align_fusi_and_behavior(
+        session,
+        session_id=session_id,
+        decoder_type=config.decoder_type,
+        frame_rate_hz=config.frame_rate_hz,
+    )
+    task_type = str(aligned.metadata["task_type"])
+    decoder_type = str(aligned.metadata["decoder_type"])
+    chance_accuracy = float(aligned.metadata["task_config"]["chance_accuracy"])
     images, preprocess_log = preprocess_power_doppler_session(
         aligned.images, config, source_path=str(mat_path), output_dir=output_dir
     )
 
-    labels = make_multicoder_labels(aligned.target_pos, center_tolerance=config.center_tolerance)
+    if task_type == "8target":
+        labels = make_multicoder_labels(aligned.target_pos, center_tolerance=config.center_tolerance)
+    elif task_type == "2target":
+        labels = make_binary_labels(aligned.target_pos)
+    else:
+        raise ValueError(f"Unsupported task_type '{task_type}'.")
     valid_mask = aligned.valid_trial_mask.copy()
-    axis_labels_all = labels["axis_labels"]
-    combined_all = labels["combined_labels"]
+    axis_labels_all = labels.get("axis_labels")
+    if task_type == "8target":
+        combined_all = labels["combined_labels"]
+    else:
+        combined_all = labels["binary_labels"]
 
     n_time = images.shape[2]
     if config.max_timepoints:
@@ -1156,20 +1909,34 @@ def decode_within_session(
             LOGGER.warning("Skipping timepoint %d: only %d trials", result_index, trial_indices.size)
             continue
 
-        axis_labels = axis_labels_all[trial_indices]
         combined = combined_all[trial_indices]
-        diagnostics = _build_trial_label_diagnostics(
-            aligned=aligned,
-            labels=labels,
-            valid_mask=valid_mask,
-            trial_indices=trial_indices,
-            requested_n_splits=config.n_splits,
-            cv_scheme=config.cv_scheme,
-            center_tolerance=config.center_tolerance,
-        )
+        if task_type == "8target":
+            assert axis_labels_all is not None
+            axis_labels = axis_labels_all[trial_indices]
+            diagnostics = _build_trial_label_diagnostics(
+                aligned=aligned,
+                labels=labels,
+                valid_mask=valid_mask,
+                trial_indices=trial_indices,
+                requested_n_splits=config.n_splits,
+                cv_scheme=config.cv_scheme,
+                center_tolerance=config.center_tolerance,
+            )
+        else:
+            axis_labels = None
+            diagnostics = _build_binary_label_diagnostics(
+                aligned=aligned,
+                labels=labels,
+                valid_mask=valid_mask,
+                trial_indices=trial_indices,
+                requested_n_splits=config.n_splits,
+                cv_scheme=config.cv_scheme,
+            )
         diagnostics.update(
             {
                 "mode": window_mode,
+                "task_type": task_type,
+                "decoder_type": decoder_type,
                 "eval_index": int(result_index),
                 "frame_indices": winfo["frame_indices"],
                 "n_window_frames": winfo["n_window_frames"],
@@ -1179,9 +1946,11 @@ def decode_within_session(
         )
         diagnostic_results.append(diagnostics)
         LOGGER.info(
-            "label diagnostics t=%d trials total=%d valid=%d cv=%d min_class=%d "
-            "actual_splits=%d combined=%s singletons=%s center5=%s near0=(x:%s,y:%s)",
+            "label diagnostics t=%d task=%s decoder=%s trials total=%d valid=%d cv=%d "
+            "min_class=%d actual_splits=%d labels=%s singletons=%s",
             result_index,
+            task_type,
+            decoder_type,
             diagnostics["n_trials_total"],
             diagnostics["n_valid_trials_after_success_and_targetPos"],
             diagnostics["n_trials_entering_CV"],
@@ -1189,9 +1958,6 @@ def decode_within_session(
             diagnostics["actual_n_splits"],
             json.dumps(diagnostics["combined_label_distribution"], sort_keys=True),
             diagnostics["combined_labels_with_count_1"],
-            diagnostics["has_real_center_center_label_5"],
-            diagnostics["target_pos_near_zero_nonzero_x"],
-            diagnostics["target_pos_near_zero_nonzero_y"],
         )
 
         if config.diagnostic_only:
@@ -1207,20 +1973,26 @@ def decode_within_session(
             )
             continue
 
-        decoded = decode_timepoint(x, axis_labels, combined, config)
+        if task_type == "8target":
+            assert axis_labels is not None
+            decoded = decode_timepoint(x, axis_labels, combined, config)
+        else:
+            decoded = decode_timepoint_binary(x, combined, config, decoder_type=decoder_type)
         mean_ang, per_trial_ang = compute_angular_error(
             decoded["predictions_combined"], decoded["actual_combined"], labels["combined_to_angle_deg"]
         )
         for fold in decoded["fold_results"]:
+            predicted_key = "predicted_combined" if "predicted_combined" in fold else "predicted_binary"
+            actual_key = "actual_combined" if "actual_combined" in fold else "actual_binary"
             fold_mean_ang, _ = compute_angular_error(
-                np.asarray(fold["predicted_combined"]),
-                np.asarray(fold["actual_combined"]),
+                np.asarray(fold[predicted_key]),
+                np.asarray(fold[actual_key]),
                 labels["combined_to_angle_deg"],
             )
             fold["mean_angular_error_deg"] = fold_mean_ang
 
         acc_p = _binomial_greater_pvalue(
-            decoded["n_correct"], decoded["n_counted"], config.chance_accuracy
+            decoded["n_correct"], decoded["n_counted"], chance_accuracy
         )
         perm = permutation_test_angular_error(
             decoded["actual_combined"],
@@ -1230,9 +2002,8 @@ def decode_within_session(
             random_seed=int(rng.integers(0, np.iinfo(np.int32).max)),
         )
 
-        conf = _confusion_matrix(
-            decoded["actual_combined"], decoded["predictions_combined"], np.arange(1, 10)
-        )
+        confusion_labels = np.arange(1, 10) if task_type == "8target" else np.arange(0, 2)
+        conf = _confusion_matrix(decoded["actual_combined"], decoded["predictions_combined"], confusion_labels)
         accuracy = _accuracy_from_confusion(conf)
         balanced_accuracy = _balanced_accuracy_from_confusion(conf)
         row_sum = conf.sum(axis=1, keepdims=True)
@@ -1241,6 +2012,8 @@ def decode_within_session(
         result = {
             **winfo,
             "mode": config.mode,
+            "task_type": task_type,
+            "decoder_type": decoder_type,
             "time_from_trial_start_s": float(aligned.time_from_trial_start_s[result_index]),
             "time_from_cue_s": float(aligned.time_from_cue_s[result_index]),
             "task_state": _task_state(
@@ -1263,14 +2036,23 @@ def decode_within_session(
             "zero_std_feature_counts": decoded["zero_std_feature_counts"],
             "accuracy_p_uncorrected": acc_p,
             "angular_error_p_uncorrected": perm["p_value"],
-            "chance_accuracy": config.chance_accuracy,
+            "chance_accuracy": chance_accuracy,
             "permutation_null_angular_error": perm,
             "actual_combined": decoded["actual_combined"],
             "predicted_combined": decoded["predictions_combined"],
             "global_trial_indices": trial_indices,
-            "confusion_matrix_counts_1_to_9": conf,
-            "confusion_matrix_row_percent_1_to_9": conf_pct,
+            "confusion_matrix_labels": confusion_labels,
+            "confusion_matrix_counts": conf,
+            "confusion_matrix_row_percent": conf_pct,
         }
+        if task_type == "8target":
+            result["confusion_matrix_counts_1_to_9"] = conf
+            result["confusion_matrix_row_percent_1_to_9"] = conf_pct
+        else:
+            result["actual_binary"] = decoded["actual_binary"]
+            result["predicted_binary"] = decoded["predictions_binary"]
+            result["confusion_matrix_counts_0_to_1"] = conf
+            result["confusion_matrix_row_percent_0_to_1"] = conf_pct
         timepoint_results.append(result)
         all_acc_p.append(acc_p)
         all_ang_p.append(perm["p_value"])
@@ -1294,6 +2076,9 @@ def decode_within_session(
             "skip_reason": skip_reason,
             "session_id": aligned.session_id,
             "source_path": str(mat_path),
+            "task_type": task_type,
+            "decoder_type": decoder_type,
+            "n_targets": int(aligned.metadata["n_targets"]),
             "n_trials_total": int(images.shape[3]),
             "n_valid_trials": int(valid_mask.sum()),
             "n_valid_trials_after_success_and_targetPos": int(valid_mask.sum()),
@@ -1307,8 +2092,10 @@ def decode_within_session(
             "frame_rate_hz": float(aligned.frame_rate_hz),
             "frame_rate_source": aligned.metadata.get("frame_rate_source"),
             "recording_system": aligned.metadata.get("recording_system"),
+            "chance_accuracy": chance_accuracy,
             "class_distribution_combined": final_diag.get("combined_label_distribution", {}),
             "combined_label_distribution": final_diag.get("combined_label_distribution", {}),
+            "binary_label_distribution": final_diag.get("binary_label_distribution", {}),
             "horizontal_label_distribution": final_diag.get("horizontal_label_distribution", {}),
             "vertical_label_distribution": final_diag.get("vertical_label_distribution", {}),
             "combined_labels_with_count_1": final_diag.get("combined_labels_with_count_1", []),
@@ -1327,10 +2114,13 @@ def decode_within_session(
             "direction_labels": {
                 "combined_to_angle_deg": labels["combined_to_angle_deg"],
                 "combined_label_names": labels["combined_label_names"],
+                "label_to_target_pos": labels.get("label_to_target_pos"),
                 "center_tolerance": float(config.center_tolerance),
                 "center_center_rule": (
                     "Multicoder center-center predictions are retained and assigned "
                     "180 deg angular error, matching the existing MATLAB evaluation."
+                    if task_type == "8target"
+                    else "Binary labels are evaluated directly; angular error uses the two target angles."
                 ),
             },
             "diagnostics": diagnostic_results,
@@ -1357,6 +2147,9 @@ def decode_within_session(
     summary = {
         "session_id": aligned.session_id,
         "source_path": str(mat_path),
+        "task_type": task_type,
+        "decoder_type": decoder_type,
+        "n_targets": int(aligned.metadata["n_targets"]),
         "n_trials_total": int(images.shape[3]),
         "n_valid_trials": int(valid_mask.sum()),
         "n_valid_trials_after_success_and_targetPos": int(valid_mask.sum()),
@@ -1370,6 +2163,7 @@ def decode_within_session(
         "frame_rate_hz": float(aligned.frame_rate_hz),
         "frame_rate_source": aligned.metadata.get("frame_rate_source"),
         "recording_system": aligned.metadata.get("recording_system"),
+        "chance_accuracy": chance_accuracy,
         "final_timepoint_index": int(final["eval_index"]),
         "accuracy": float(final["accuracy"]),
         "balanced_accuracy": float(final["balanced_accuracy"]),
@@ -1382,14 +2176,19 @@ def decode_within_session(
         "pca_component_range": [int(pca_all.min()), int(pca_all.max())],
         "class_distribution_combined": class_distribution,
         "combined_label_distribution": final["label_diagnostics"]["combined_label_distribution"],
-        "horizontal_label_distribution": final["label_diagnostics"]["horizontal_label_distribution"],
-        "vertical_label_distribution": final["label_diagnostics"]["vertical_label_distribution"],
+        "binary_label_distribution": final["label_diagnostics"].get("binary_label_distribution", {}),
+        "horizontal_label_distribution": final["label_diagnostics"].get("horizontal_label_distribution", {}),
+        "vertical_label_distribution": final["label_diagnostics"].get("vertical_label_distribution", {}),
         "combined_labels_with_count_1": final["label_diagnostics"]["combined_labels_with_count_1"],
-        "has_real_center_center_label_5": final["label_diagnostics"]["has_real_center_center_label_5"],
-        "target_pos_near_zero_nonzero_x": final["label_diagnostics"]["target_pos_near_zero_nonzero_x"],
-        "target_pos_near_zero_nonzero_y": final["label_diagnostics"]["target_pos_near_zero_nonzero_y"],
-        "target_pos_near_zero_nonzero_x_count": final["label_diagnostics"]["target_pos_near_zero_nonzero_x_count"],
-        "target_pos_near_zero_nonzero_y_count": final["label_diagnostics"]["target_pos_near_zero_nonzero_y_count"],
+        "has_real_center_center_label_5": final["label_diagnostics"].get("has_real_center_center_label_5", False),
+        "target_pos_near_zero_nonzero_x": final["label_diagnostics"].get("target_pos_near_zero_nonzero_x", False),
+        "target_pos_near_zero_nonzero_y": final["label_diagnostics"].get("target_pos_near_zero_nonzero_y", False),
+        "target_pos_near_zero_nonzero_x_count": final["label_diagnostics"].get(
+            "target_pos_near_zero_nonzero_x_count", 0
+        ),
+        "target_pos_near_zero_nonzero_y_count": final["label_diagnostics"].get(
+            "target_pos_near_zero_nonzero_y_count", 0
+        ),
         "target_pos_distribution_round6": final["label_diagnostics"]["target_pos_distribution_round6"],
     }
     result_dict = {
@@ -1400,10 +2199,13 @@ def decode_within_session(
         "direction_labels": {
             "combined_to_angle_deg": labels["combined_to_angle_deg"],
             "combined_label_names": labels["combined_label_names"],
+            "label_to_target_pos": labels.get("label_to_target_pos"),
             "center_tolerance": float(config.center_tolerance),
             "center_center_rule": (
                 "Multicoder center-center predictions are retained and assigned "
                 "180 deg angular error, matching the existing MATLAB evaluation."
+                if task_type == "8target"
+                else "Binary labels are evaluated directly; angular error uses the two target angles."
             ),
         },
         "diagnostics": diagnostic_results,
@@ -1443,6 +2245,9 @@ def save_results(result: dict[str, Any], output_dir: Path, session_id: str) -> N
             "source_path",
             "status",
             "skip_reason",
+            "task_type",
+            "decoder_type",
+            "n_targets",
             "mode",
             "cv_scheme",
             "requested_n_splits",
@@ -1453,6 +2258,7 @@ def save_results(result: dict[str, Any], output_dir: Path, session_id: str) -> N
             "n_valid_trials_after_success_and_targetPos",
             "n_trials_entering_CV",
             "combined_label_distribution",
+            "binary_label_distribution",
             "horizontal_label_distribution",
             "vertical_label_distribution",
             "combined_labels_with_count_1",
@@ -1505,6 +2311,9 @@ def save_results(result: dict[str, Any], output_dir: Path, session_id: str) -> N
     summary_fields = [
         "session_id",
         "source_path",
+        "task_type",
+        "decoder_type",
+        "n_targets",
         "mode",
         "cv_scheme",
         "n_splits",
@@ -1520,12 +2329,16 @@ def save_results(result: dict[str, Any], output_dir: Path, session_id: str) -> N
         "time_from_cue_s",
         "eval_index",
         "frame_indices",
-        "confusion_matrix_counts_1_to_9",
-        "confusion_matrix_row_percent_1_to_9",
+        "confusion_matrix_labels",
+        "confusion_matrix_counts",
+        "confusion_matrix_row_percent",
     ]
     summary_row = {
         "session_id": result["summary"]["session_id"],
         "source_path": result["summary"]["source_path"],
+        "task_type": result["summary"]["task_type"],
+        "decoder_type": result["summary"]["decoder_type"],
+        "n_targets": result["summary"]["n_targets"],
         "mode": result["summary"]["mode"],
         "cv_scheme": result["summary"]["cv_scheme"],
         "n_splits": result["config"]["n_splits"],
@@ -1541,12 +2354,9 @@ def save_results(result: dict[str, Any], output_dir: Path, session_id: str) -> N
         "time_from_cue_s": final["time_from_cue_s"],
         "eval_index": final["eval_index"],
         "frame_indices": json.dumps(_to_jsonable(final["frame_indices"])),
-        "confusion_matrix_counts_1_to_9": json.dumps(
-            _to_jsonable(final["confusion_matrix_counts_1_to_9"])
-        ),
-        "confusion_matrix_row_percent_1_to_9": json.dumps(
-            _to_jsonable(final["confusion_matrix_row_percent_1_to_9"])
-        ),
+        "confusion_matrix_labels": json.dumps(_to_jsonable(final["confusion_matrix_labels"])),
+        "confusion_matrix_counts": json.dumps(_to_jsonable(final["confusion_matrix_counts"])),
+        "confusion_matrix_row_percent": json.dumps(_to_jsonable(final["confusion_matrix_row_percent"])),
     }
     with summary_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=summary_fields)
@@ -1593,6 +2403,30 @@ def _plot_direction_confusion_matrix(
     plt.close(fig)
 
 
+def _plot_binary_confusion_matrix(
+    plt: Any,
+    confusion_row_percent: np.ndarray,
+    output_path: Path,
+    *,
+    title: str = "Binary confusion matrix",
+) -> None:
+    cm = np.asarray(confusion_row_percent, dtype=float)
+    fig, ax = plt.subplots(figsize=(4.8, 4.4), constrained_layout=True)
+    im = ax.imshow(cm, cmap="magma", vmin=0, vmax=100, interpolation="nearest")
+    ax.set_xticks([0, 1], labels=["0", "1"])
+    ax.set_yticks([0, 1], labels=["0", "1"])
+    ax.set_xlabel("Predicted class", fontsize=13)
+    ax.set_ylabel("True class", fontsize=13)
+    ax.set_title(title, fontsize=14, pad=12)
+    for row in range(2):
+        for col in range(2):
+            ax.text(col, row, f"{cm[row, col]:.1f}", ha="center", va="center", color="white", fontsize=12)
+    cbar = fig.colorbar(im, ax=ax, orientation="horizontal", fraction=0.1, pad=0.14)
+    cbar.set_label("Percent (%)", fontsize=12)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_within_session_results(result: dict[str, Any], output_dir: str | Path) -> None:
     """Generate performance, confusion, and diagnostic plots."""
 
@@ -1626,7 +2460,7 @@ def plot_within_session_results(result: dict[str, Any], output_dir: str | Path) 
     fig, axes = plt.subplots(2, 1, figsize=(8, 7), sharex=True, constrained_layout=True)
     axes[0].plot(t, acc, color="#1f77b4", marker="o", ms=3)
     axes[0].fill_between(t, acc - acc_sem, acc + acc_sem, color="#1f77b4", alpha=0.18, linewidth=0)
-    axes[0].axhline(result["config"]["chance_accuracy"] * 100, color="0.35", ls="--", lw=1)
+    axes[0].axhline(result["summary"].get("chance_accuracy", result["config"]["chance_accuracy"]) * 100, color="0.35", ls="--", lw=1)
     axes[0].scatter(t[acc_sig], acc[acc_sig], color="#d62728", zorder=3, s=24)
     axes[0].axvline(0, color="0.2", lw=1)
     axes[0].set_ylabel("Percent correct")
@@ -1644,12 +2478,20 @@ def plot_within_session_results(result: dict[str, Any], output_dir: str | Path) 
     plt.close(fig)
 
     final = timepoints[-1]
-    cm = np.asarray(final["confusion_matrix_row_percent_1_to_9"], dtype=float)
-    _plot_direction_confusion_matrix(
-        plt,
-        cm,
-        output_dir / f"{result['summary']['session_id']}_confusion_final.png",
-    )
+    if result["summary"].get("task_type") == "2target":
+        cm = np.asarray(final["confusion_matrix_row_percent"], dtype=float)
+        _plot_binary_confusion_matrix(
+            plt,
+            cm,
+            output_dir / f"{result['summary']['session_id']}_confusion_final.png",
+        )
+    else:
+        cm = np.asarray(final["confusion_matrix_row_percent_1_to_9"], dtype=float)
+        _plot_direction_confusion_matrix(
+            plt,
+            cm,
+            output_dir / f"{result['summary']['session_id']}_confusion_final.png",
+        )
 
     fig, axes = plt.subplots(3, 1, figsize=(8, 8), sharex=True, constrained_layout=True)
     axes[0].plot(t, [r["n_trials"] for r in timepoints], color="#4c78a8")
@@ -1674,6 +2516,8 @@ def print_summary(summary: dict[str, Any]) -> None:
     print(f"  valid trials: {summary['n_valid_trials']}")
     if "n_trials_entering_CV" in summary:
         print(f"  trials entering CV: {summary['n_trials_entering_CV']}")
+    if "task_type" in summary:
+        print(f"  task/decoder: {summary['task_type']} / {summary['decoder_type']}")
     print(f"  mode: {summary['mode']}")
     print(f"  CV scheme: {summary['cv_scheme']}")
     if "actual_n_splits" in summary:
@@ -1701,6 +2545,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mat_path", help="Path to doppler_S*_R*+normcorre.mat")
     parser.add_argument("--output-dir", default=WithinSessionConfig.output_dir)
+    parser.add_argument("--decoder-type", choices=sorted(VALID_DECODER_TYPES), default=None)
+    parser.add_argument("--frame-rate-hz", type=float, default=None)
     parser.add_argument(
         "--mode",
         default=WithinSessionConfig.mode,
@@ -1713,6 +2559,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cv-scheme", default=WithinSessionConfig.cv_scheme, choices=["loo", "kfold"])
     parser.add_argument("--n-splits", type=int, default=10)
     parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument(
+        "--cpca-m",
+        type=int,
+        default=WithinSessionConfig.cpca_m,
+        help="Final CPCA subspace dimension, matching trainCPCA.m's m parameter.",
+    )
     parser.add_argument("--n-permutations", type=int, default=100_000)
     parser.add_argument("--max-timepoints", type=int, default=None)
     parser.add_argument("--center-tolerance", type=float, default=WithinSessionConfig.center_tolerance)
@@ -1724,9 +2576,12 @@ def main(argv: list[str] | None = None) -> int:
 
     config = WithinSessionConfig(
         mode=args.mode,
+        decoder_type=args.decoder_type,
+        frame_rate_hz=args.frame_rate_hz,
         cv_scheme=args.cv_scheme,
         n_splits=args.n_splits,
         random_seed=args.seed,
+        cpca_m=args.cpca_m,
         n_permutations=args.n_permutations,
         output_dir=args.output_dir,
         max_timepoints=args.max_timepoints,

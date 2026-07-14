@@ -30,6 +30,9 @@ To reproduce the older per-timepoint dynamic-window analysis, explicitly pass:
 --mode dynamic_time_window
 ```
 
+For 2-target sessions, the default decoder is `cpca_lda`; `--cpca-m` controls
+the final CPCA subspace dimension and defaults to MATLAB `trainCPCA.m`'s `m=1`.
+
 Fast smoke test:
 
 ```bash
@@ -88,6 +91,12 @@ MPLCONFIGDIR=/tmp/ppc_matplotlib_cache .venv/bin/python run_batch_within_session
   --cv-scheme kfold \
   --n-permutations 100000
 ```
+
+For stratified k-fold runs, sessions with a combined-direction class count
+below 2 are written as `status=skipped` with
+`skip_reason=insufficient_class_count`. If the smallest class has 2-9 trials,
+the runner automatically uses that count as `actual_n_splits`; otherwise it
+uses the requested 10-fold split.
 
 To diagnose the failed sessions without training the decoder:
 

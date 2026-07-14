@@ -35,6 +35,7 @@ DEFAULT_OUTPUT_DIR = DEFAULT_DATA_ROOT / "output" / "python_within_session_batch
 def _find_project_record(data_root: Path) -> Path:
     candidates = [
         data_root / "projectrecord",
+        data_root / "project_record.json",
         data_root / "ProjectRecord_paper.json",
         data_root / "ProjectRecord.json",
         data_root / "projectrecord.json",
@@ -62,11 +63,20 @@ def _session_token(record: dict[str, Any]) -> str:
 
 
 def _expected_mat_path(record: dict[str, Any], doppler_dir: Path) -> Path:
-    return doppler_dir / f"doppler_{_session_token(record)}+normcorre.mat"
+    token = _session_token(record)
+    candidates = [
+        doppler_dir / f"doppler_{token}+normcorre.mat",
+        doppler_dir / f"doppler_{token}.mat",
+        doppler_dir / f"rt_fUS_data_{token}.mat",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def _record_is_decodable(record: dict[str, Any]) -> bool:
-    return int(record.get("nTrials") or 0) > 0 and int(record.get("nTargets") or 0) == 8
+    return int(record.get("nTrials") or 0) > 0 and int(record.get("nTargets") or 0) in {2, 8}
 
 
 def _parse_session_filters(values: list[str] | None) -> set[str] | None:
@@ -149,6 +159,10 @@ def _summary_row(
         "ap_plane": record.get("ap_plane"),
         "record_n_trials": record.get("nTrials"),
         "record_n_targets": record.get("nTargets"),
+        "task_type": "",
+        "decoder_type": "",
+        "frame_rate_hz": "",
+        "frame_rate_source": "",
         "mat_path": str(mat_path),
         "output_dir": str(output_dir),
         "n_valid_trials": "",
@@ -161,6 +175,7 @@ def _summary_row(
         "actual_n_splits": "",
         "center_tolerance": "",
         "combined_label_distribution": "",
+        "binary_label_distribution": "",
         "horizontal_label_distribution": "",
         "vertical_label_distribution": "",
         "combined_labels_with_count_1": "",
@@ -183,6 +198,10 @@ def _summary_row(
         row.update(
             {
                 "n_valid_trials": summary.get("n_valid_trials", ""),
+                "task_type": summary.get("task_type", ""),
+                "decoder_type": summary.get("decoder_type", ""),
+                "frame_rate_hz": summary.get("frame_rate_hz", ""),
+                "frame_rate_source": summary.get("frame_rate_source", ""),
                 "n_trials_total": summary.get("n_trials_total", ""),
                 "n_valid_trials_after_success_and_targetPos": summary.get(
                     "n_valid_trials_after_success_and_targetPos", ""
@@ -196,6 +215,7 @@ def _summary_row(
                 "combined_label_distribution": json.dumps(
                     summary.get("combined_label_distribution", summary.get("class_distribution_combined", ""))
                 ),
+                "binary_label_distribution": json.dumps(summary.get("binary_label_distribution", "")),
                 "horizontal_label_distribution": json.dumps(summary.get("horizontal_label_distribution", "")),
                 "vertical_label_distribution": json.dumps(summary.get("vertical_label_distribution", "")),
                 "combined_labels_with_count_1": json.dumps(summary.get("combined_labels_with_count_1", "")),
@@ -285,6 +305,18 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--cv-scheme", default=WithinSessionConfig.cv_scheme, choices=["loo", "kfold"])
+    parser.add_argument(
+        "--decoder-type",
+        default=None,
+        choices=["multicoder_pca_lda", "pca_lda", "cpca_lda"],
+        help="Override the metadata-inferred decoder. Leave unset to use task defaults.",
+    )
+    parser.add_argument(
+        "--frame-rate-hz",
+        type=float,
+        default=None,
+        help="Override file/metadata frame rate, useful for 2-target RT/BMI files without RecordingSystem.",
+    )
     parser.add_argument("--n-splits", type=int, default=10)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--n-permutations", type=int, default=100_000)
@@ -297,7 +329,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     data_root = args.data_root.expanduser().resolve()
-    doppler_dir = (args.doppler_dir or data_root / "doppler").expanduser().resolve()
+    if args.doppler_dir is not None:
+        doppler_dir = args.doppler_dir.expanduser().resolve()
+    elif (data_root / "doppler data").exists():
+        doppler_dir = (data_root / "doppler data").expanduser().resolve()
+    else:
+        doppler_dir = (data_root / "doppler").expanduser().resolve()
     project_record_path = (args.project_record or _find_project_record(data_root)).expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     session_filters = _parse_session_filters(args.sessions)
@@ -310,6 +347,8 @@ def main(argv: list[str] | None = None) -> int:
     records = _load_project_record(project_record_path)
     config = WithinSessionConfig(
         mode=args.mode,
+        decoder_type=args.decoder_type,
+        frame_rate_hz=args.frame_rate_hz,
         cv_scheme=args.cv_scheme,
         n_splits=args.n_splits,
         random_seed=args.seed,
