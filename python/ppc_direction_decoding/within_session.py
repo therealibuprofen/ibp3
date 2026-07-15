@@ -916,28 +916,69 @@ def make_multicoder_labels(target_pos: np.ndarray, center_tolerance: float = 1e-
     }
 
 
-def make_binary_labels(target_pos: np.ndarray, decimals: int = 6) -> dict[str, Any]:
-    """Encode exactly two unique target positions as labels 0 and 1."""
+def make_binary_labels(
+    target_pos: np.ndarray,
+    decimals: int = 6,
+    center_tolerance: float = 1e-6,
+) -> dict[str, Any]:
+    """Encode 2-target choices as labels 0 and 1.
+
+    Some RT/BMI sessions store multiple target eccentricities for the same
+    left/right choice. If exactly two unique positions are present, labels are
+    assigned by position. If more positions are present but all lie on the
+    horizontal axis, labels are assigned by x sign: left is 0, right is 1.
+    """
 
     target_pos = np.asarray(target_pos, dtype=float)
     finite = np.all(np.isfinite(target_pos), axis=1)
     rounded = np.round(target_pos[finite], decimals=decimals)
     unique = np.unique(rounded, axis=0) if rounded.size else np.empty((0, 2), dtype=float)
-    if unique.shape[0] != 2:
+    labels = np.full(target_pos.shape[0], -1, dtype=int)
+    mapping: dict[int, Any] = {}
+    label_names: dict[int, str] = {}
+    strategy = "exact_target_position"
+
+    if unique.shape[0] == 2:
+        pos_to_label = {tuple(row.tolist()): i for i, row in enumerate(unique)}
+        for i, pos in enumerate(np.round(target_pos, decimals=decimals)):
+            if np.all(np.isfinite(pos)):
+                labels[i] = pos_to_label[tuple(pos.tolist())]
+        for pos, label in pos_to_label.items():
+            mapping[int(label)] = [float(pos[0]), float(pos[1])]
+            label_names[int(label)] = f"target_{label}"
+    else:
+        y_is_center = np.all(np.abs(unique[:, 1]) <= center_tolerance) if unique.size else False
+        has_left = bool(np.any(unique[:, 0] < -center_tolerance)) if unique.size else False
+        has_right = bool(np.any(unique[:, 0] > center_tolerance)) if unique.size else False
+        has_center_x = bool(np.any(np.abs(unique[:, 0]) <= center_tolerance)) if unique.size else False
+        if y_is_center and has_left and has_right and not has_center_x:
+            strategy = "horizontal_sign"
+            rounded_all = np.round(target_pos, decimals=decimals)
+            finite_all = np.all(np.isfinite(rounded_all), axis=1)
+            labels[finite_all & (rounded_all[:, 0] < -center_tolerance)] = 0
+            labels[finite_all & (rounded_all[:, 0] > center_tolerance)] = 1
+            left_positions = unique[unique[:, 0] < -center_tolerance]
+            right_positions = unique[unique[:, 0] > center_tolerance]
+            mapping = {
+                0: [[float(x), float(y)] for x, y in left_positions],
+                1: [[float(x), float(y)] for x, y in right_positions],
+            }
+            label_names = {0: "left", 1: "right"}
+        else:
+            actual = unique.astype(float).tolist()
+            raise ValueError(
+                "2-target binary decoding requires exactly two unique finite target positions, "
+                "or horizontal left/right target positions that can be grouped by x sign; "
+                f"found {unique.shape[0]}: {actual}"
+            )
+
+    present_labels = set(labels[labels >= 0].astype(int).tolist())
+    if present_labels != {0, 1}:
         actual = unique.astype(float).tolist()
         raise ValueError(
-            "2-target binary decoding requires exactly two unique finite target positions; "
-            f"found {unique.shape[0]}: {actual}"
+            "2-target binary decoding could not assign both binary classes 0 and 1; "
+            f"assigned labels={sorted(present_labels)}, unique target positions={actual}"
         )
-
-    labels = np.full(target_pos.shape[0], -1, dtype=int)
-    mapping: dict[int, list[float]] = {}
-    pos_to_label = {tuple(row.tolist()): i for i, row in enumerate(unique)}
-    for i, pos in enumerate(np.round(target_pos, decimals=decimals)):
-        if np.all(np.isfinite(pos)):
-            labels[i] = pos_to_label[tuple(pos.tolist())]
-    for pos, label in pos_to_label.items():
-        mapping[int(label)] = [float(pos[0]), float(pos[1])]
 
     angles_deg = np.degrees(np.arctan2(target_pos[:, 1], target_pos[:, 0]))
     angles_deg = np.mod(angles_deg, 360.0)
@@ -948,7 +989,10 @@ def make_binary_labels(target_pos: np.ndarray, decimals: int = 6) -> dict[str, A
         mean_angle = math.degrees(math.atan2(np.sin(radians).mean(), np.cos(radians).mean()))
         label_to_angle[int(label)] = float(mean_angle % 360.0)
 
-    message = f"Binary target position to label mapping: {json.dumps(mapping, sort_keys=True)}"
+    message = (
+        "Binary target position to label mapping "
+        f"({strategy}): {json.dumps(mapping, sort_keys=True)}"
+    )
     print(message)
     LOGGER.info(message)
     return {
@@ -956,8 +1000,9 @@ def make_binary_labels(target_pos: np.ndarray, decimals: int = 6) -> dict[str, A
         "target_angles_deg": angles_deg,
         "label_to_target_pos": mapping,
         "combined_to_angle_deg": label_to_angle,
-        "combined_label_names": {label: f"target_{label}" for label in mapping},
+        "combined_label_names": label_names,
         "round_decimals": int(decimals),
+        "binary_label_strategy": strategy,
     }
 
 
@@ -1066,6 +1111,7 @@ def _build_binary_label_diagnostics(
         "requested_n_splits": int(requested_n_splits),
         "actual_n_splits": int(actual_n_splits),
         "label_to_target_pos": labels["label_to_target_pos"],
+        "binary_label_strategy": labels.get("binary_label_strategy"),
     }
 
 
@@ -1866,7 +1912,7 @@ def decode_within_session(
     if task_type == "8target":
         labels = make_multicoder_labels(aligned.target_pos, center_tolerance=config.center_tolerance)
     elif task_type == "2target":
-        labels = make_binary_labels(aligned.target_pos)
+        labels = make_binary_labels(aligned.target_pos, center_tolerance=config.center_tolerance)
     else:
         raise ValueError(f"Unsupported task_type '{task_type}'.")
     valid_mask = aligned.valid_trial_mask.copy()
