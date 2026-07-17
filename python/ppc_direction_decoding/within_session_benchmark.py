@@ -29,6 +29,10 @@ from typing import Any
 import numpy as np
 
 
+# Required by CUDA/cuBLAS when PyTorch deterministic algorithms are enabled.
+# This must be set before CUDA is initialized, so do it at module import time.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 LOGGER = logging.getLogger(__name__)
 ALL_MODELS = ("pca_lda", "cpca_lda", "cnn", "cnn_lstm")
 LINEAR_MODELS = {"pca_lda", "cpca_lda"}
@@ -65,6 +69,7 @@ class BenchmarkConfig:
     spatial_filter_radius: int = 2
     direct_8class: bool = False
     merge_existing: bool = True
+    deterministic_torch: bool = True
 
 
 @dataclass
@@ -144,6 +149,7 @@ def set_global_seed(seed: int, deterministic_torch: bool = True) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     if deterministic_torch:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         try:
             torch.use_deterministic_algorithms(True, warn_only=True)
         except Exception:
@@ -750,7 +756,7 @@ def _deep_train_predict_fold(
 ) -> dict[str, Any]:
     torch = _require("torch")
     data = _require("torch.utils.data")
-    set_global_seed(seed)
+    set_global_seed(seed, deterministic_torch=config.deterministic_torch)
     device = _select_device(config.device)
     inner_train_idx, val_idx, val_strategy = _make_validation_split(
         train_idx, y, config.validation_fraction, seed
@@ -1213,6 +1219,7 @@ def environment_info(device: str) -> dict[str, Any]:
         "mps_available": False,
         "device": device,
         "device_name": device,
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
     }
     try:
         sklearn = _require("sklearn")
@@ -1274,7 +1281,7 @@ def run_benchmark(
     provisional_session_id = session_id or getattr(core, "_infer_session_id")(str(mat_path))
     output_dir = base_output / provisional_session_id
     output_dir.mkdir(parents=True, exist_ok=True)
-    set_global_seed(config.random_seed)
+    set_global_seed(config.random_seed, deterministic_torch=config.deterministic_torch)
 
     aligned, preprocess_log, windows, label_info, core_config, chance = prepare_benchmark_windows(
         core=core,
@@ -1656,6 +1663,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-detrend", action="store_true", help="Disable causal detrending in preprocessing.")
     parser.add_argument("--no-spatial-filter", action="store_true", help="Disable pillbox spatial filtering in preprocessing.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing benchmark JSON/CSV instead of merging by model.")
+    parser.add_argument(
+        "--no-deterministic",
+        action="store_true",
+        help=(
+            "Disable torch deterministic algorithms. This can avoid CUDA/cuBLAS deterministic "
+            "errors on older server stacks, at the cost of less reproducible CNN training."
+        ),
+    )
     parser.add_argument("--self-test", action="store_true", help="Run synthetic benchmark tests instead of a real MAT file.")
     return parser
 
@@ -1695,6 +1710,7 @@ def main(argv: list[str] | None = None) -> int:
         detrend_window=0 if args.no_detrend else BenchmarkConfig.detrend_window,
         spatial_filter_radius=0 if args.no_spatial_filter else BenchmarkConfig.spatial_filter_radius,
         merge_existing=not args.overwrite,
+        deterministic_torch=not args.no_deterministic,
     )
     run_benchmark(args.mat_path, config, core_script=args.core_script)
     return 0
