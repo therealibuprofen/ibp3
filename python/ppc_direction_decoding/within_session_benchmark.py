@@ -1586,9 +1586,34 @@ def run_synthetic_tests() -> None:
 
 
 def _parse_models(values: list[str]) -> tuple[str, ...]:
-    if not values or values == ["all"] or "all" in values:
+    expanded: list[str] = []
+    for value in values or []:
+        expanded.extend(item.strip() for item in str(value).split(",") if item.strip())
+    if not expanded or expanded == ["all"] or "all" in expanded:
         return ALL_MODELS
-    return tuple(values)
+    return tuple(expanded)
+
+
+def _normalize_cli_argv(argv: list[str] | None) -> list[str] | None:
+    r"""Make pasted commands robust to chat apps mangling shell continuations.
+
+    A common failure mode is copying a multi-line command through WeChat or a
+    notebook and pasting it as ``\  --flag``. In POSIX shells, ``\ `` becomes a
+    literal single-space argument, so argparse assigns that whitespace token to
+    the positional ``mat_path`` and reports the real MAT path as unrecognized.
+    Stripping and dropping pure-whitespace arguments keeps normal shell usage
+    unchanged while making these pasted commands parse as intended.
+    """
+
+    if argv is None:
+        argv = sys.argv[1:]
+    out: list[str] = []
+    for arg in argv:
+        cleaned = str(arg).strip()
+        if not cleaned or cleaned == "\\":
+            continue
+        out.append(cleaned)
+    return out
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1637,6 +1662,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
+    argv = _normalize_cli_argv(argv)
     args = parser.parse_args(argv)
     if args.self_test:
         run_synthetic_tests()
