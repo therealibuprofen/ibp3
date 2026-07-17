@@ -61,6 +61,10 @@ class BenchmarkConfig:
     deep_hidden_dim: int = 64
     deep_dropout: float = 0.2
     use_class_weights: bool = True
+    deep_foreground_mode: str = "crop"
+    foreground_epsilon: float = 1e-8
+    foreground_margin: int = 2
+    normalize_foreground_only: bool = True
     device: str = "auto"
     num_workers: int = 0
     frame_rate_hz: float | None = None
@@ -537,9 +541,12 @@ class _FrameDataset:
         model_name: str,
         task_type: str,
         normalization: dict[str, Any],
+        spatial_roi: dict[str, Any] | None = None,
     ) -> None:
         torch = _require("torch")
         arr = np.asarray(x[indices], dtype=np.float32)
+        arr = _apply_spatial_roi(arr, spatial_roi)
+        background = np.abs(arr) <= float(normalization.get("foreground_epsilon", 0.0))
         if model_name == "cnn":
             mean = np.asarray(normalization["mean"], dtype=np.float32).reshape(1, -1, 1, 1)
             std = np.asarray(normalization["std"], dtype=np.float32).reshape(1, -1, 1, 1)
@@ -548,6 +555,9 @@ class _FrameDataset:
             mean = float(normalization["mean"])
             std = float(normalization["std"])
             arr = ((arr - mean) / std)[:, :, None, :, :]
+            background = background[:, :, None, :, :]
+        if normalization.get("foreground_only", False):
+            arr = np.where(background, 0.0, arr)
         self.x = torch.from_numpy(arr.astype(np.float32, copy=False))
         self.y = torch.from_numpy(np.asarray(y[indices], dtype=np.int64))
         self.axis = None if axis is None else torch.from_numpy(np.asarray(axis[indices], dtype=np.int64))
@@ -564,16 +574,104 @@ class _FrameDataset:
         return self.x[idx], self.y[idx]
 
 
-def _normalization_from_train(x_train_frames: np.ndarray, model_name: str) -> dict[str, Any]:
+def _normalization_from_train(
+    x_train_frames: np.ndarray,
+    model_name: str,
+    *,
+    foreground_epsilon: float = 0.0,
+    foreground_only: bool = False,
+) -> dict[str, Any]:
+    x_train_frames = np.asarray(x_train_frames, dtype=np.float32)
+    foreground = np.abs(x_train_frames) > float(foreground_epsilon)
     if model_name == "cnn":
-        mean = x_train_frames.mean(axis=(0, 2, 3))
-        std = x_train_frames.std(axis=(0, 2, 3))
+        mean = np.zeros(x_train_frames.shape[1], dtype=np.float32)
+        std = np.ones(x_train_frames.shape[1], dtype=np.float32)
+        counts = []
+        for frame_idx in range(x_train_frames.shape[1]):
+            values = x_train_frames[:, frame_idx, :, :]
+            if foreground_only:
+                values = values[foreground[:, frame_idx, :, :]]
+            else:
+                values = values.reshape(-1)
+            counts.append(int(values.size))
+            if values.size:
+                mean[frame_idx] = float(values.mean())
+                frame_std = float(values.std())
+                std[frame_idx] = frame_std if frame_std >= 1e-6 else 1.0
         std = np.where(std < 1e-6, 1.0, std)
-        return {"mean": mean.astype(float), "std": std.astype(float)}
-    std = float(x_train_frames.std())
+        return {
+            "mean": mean.astype(float),
+            "std": std.astype(float),
+            "foreground_only": bool(foreground_only),
+            "foreground_epsilon": float(foreground_epsilon),
+            "normalization_counts": counts,
+        }
+    values = x_train_frames[foreground] if foreground_only else x_train_frames.reshape(-1)
+    if values.size == 0:
+        values = x_train_frames.reshape(-1)
+    std = float(values.std())
     if std < 1e-6:
         std = 1.0
-    return {"mean": float(x_train_frames.mean()), "std": std}
+    return {
+        "mean": float(values.mean()) if values.size else 0.0,
+        "std": std,
+        "foreground_only": bool(foreground_only),
+        "foreground_epsilon": float(foreground_epsilon),
+        "normalization_counts": int(values.size),
+    }
+
+
+def _foreground_roi_from_train(
+    x_train_frames: np.ndarray,
+    *,
+    mode: str,
+    epsilon: float,
+    margin: int,
+) -> dict[str, Any]:
+    """Create a deep-model foreground transform from training data only."""
+
+    _, _, height, width = x_train_frames.shape
+    mode = str(mode).lower()
+    roi = {
+        "mode": mode,
+        "original_shape": [int(height), int(width)],
+        "bbox": [0, int(height), 0, int(width)],
+        "roi_shape": [int(height), int(width)],
+        "active_pixel_fraction": 1.0,
+        "status": "disabled" if mode == "none" else "full_image",
+    }
+    if mode == "none":
+        return roi
+    if mode != "crop":
+        raise ValueError(f"Unsupported deep_foreground_mode '{mode}'. Use 'crop' or 'none'.")
+
+    active = np.any(np.abs(np.asarray(x_train_frames)) > float(epsilon), axis=(0, 1))
+    active_count = int(active.sum())
+    roi["active_pixel_fraction"] = float(active_count / max(1, height * width))
+    if active_count == 0:
+        roi["status"] = "empty_foreground_fallback_full_image"
+        return roi
+
+    ys, xs = np.where(active)
+    pad = max(0, int(margin))
+    y0 = max(0, int(ys.min()) - pad)
+    y1 = min(int(height), int(ys.max()) + pad + 1)
+    x0 = max(0, int(xs.min()) - pad)
+    x1 = min(int(width), int(xs.max()) + pad + 1)
+    if y1 <= y0 or x1 <= x0:
+        roi["status"] = "invalid_bbox_fallback_full_image"
+        return roi
+    roi["bbox"] = [int(y0), int(y1), int(x0), int(x1)]
+    roi["roi_shape"] = [int(y1 - y0), int(x1 - x0)]
+    roi["status"] = "cropped" if (y0, y1, x0, x1) != (0, height, 0, width) else "full_image_no_crop"
+    return roi
+
+
+def _apply_spatial_roi(x_frames: np.ndarray, spatial_roi: dict[str, Any] | None) -> np.ndarray:
+    if not spatial_roi or spatial_roi.get("mode") != "crop":
+        return x_frames
+    y0, y1, x0, x1 = [int(v) for v in spatial_roi["bbox"]]
+    return x_frames[:, :, y0:y1, x0:x1]
 
 
 def _make_validation_split(
@@ -838,14 +936,34 @@ def _deep_train_predict_fold(
     inner_train_idx, val_idx, val_strategy = _make_validation_split(
         train_idx, y, config.validation_fraction, seed
     )
-    normalization = _normalization_from_train(x_frames[inner_train_idx], model_name)
-    train_ds = _FrameDataset(x_frames, y, labels_axis, inner_train_idx, model_name, task_type, normalization)
+    spatial_roi = _foreground_roi_from_train(
+        x_frames[inner_train_idx],
+        mode=config.deep_foreground_mode,
+        epsilon=config.foreground_epsilon,
+        margin=config.foreground_margin,
+    )
+    normalization = _normalization_from_train(
+        _apply_spatial_roi(x_frames[inner_train_idx], spatial_roi),
+        model_name,
+        foreground_epsilon=config.foreground_epsilon,
+        foreground_only=bool(config.normalize_foreground_only),
+    )
+    train_ds = _FrameDataset(
+        x_frames,
+        y,
+        labels_axis,
+        inner_train_idx,
+        model_name,
+        task_type,
+        normalization,
+        spatial_roi,
+    )
     val_ds = (
-        _FrameDataset(x_frames, y, labels_axis, val_idx, model_name, task_type, normalization)
+        _FrameDataset(x_frames, y, labels_axis, val_idx, model_name, task_type, normalization, spatial_roi)
         if val_idx.size
         else None
     )
-    test_ds = _FrameDataset(x_frames, y, labels_axis, test_idx, model_name, task_type, normalization)
+    test_ds = _FrameDataset(x_frames, y, labels_axis, test_idx, model_name, task_type, normalization, spatial_roi)
     batch_size = max(1, min(int(config.batch_size), len(train_ds)))
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -863,7 +981,7 @@ def _deep_train_predict_fold(
     )
     test_loader = data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=config.num_workers)
 
-    _, t_frames, h, w = x_frames.shape
+    _, t_frames, h, w = _apply_spatial_roi(x_frames[:1], spatial_roi).shape
     model = _build_model(model_name, task_type, t_frames, h, w, config).to(device)
     class_weights = _make_deep_class_weights(
         y=y,
@@ -944,6 +1062,7 @@ def _deep_train_predict_fold(
     }
     pred["model_info"] = {
         "normalization": normalization,
+        "spatial_roi": spatial_roi,
         "device": device,
         "batch_size": int(batch_size),
         "validation_strategy": val_strategy,
@@ -1783,6 +1902,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable train-fold class weights for CNN/CNN+LSTM losses.",
     )
+    parser.add_argument(
+        "--deep-foreground-mode",
+        choices=["crop", "none"],
+        default=BenchmarkConfig.deep_foreground_mode,
+        help=(
+            "Foreground handling for CNN/CNN+LSTM. 'crop' computes a nonzero-pixel ROI "
+            "from the inner training split only; 'none' keeps the full image."
+        ),
+    )
+    parser.add_argument(
+        "--foreground-epsilon",
+        type=float,
+        default=BenchmarkConfig.foreground_epsilon,
+        help="Absolute-value threshold used to detect foreground pixels for deep ROI cropping.",
+    )
+    parser.add_argument(
+        "--foreground-margin",
+        type=int,
+        default=BenchmarkConfig.foreground_margin,
+        help="Pixel margin added around the train-fold foreground bounding box.",
+    )
+    parser.add_argument(
+        "--normalize-all-pixels",
+        action="store_true",
+        help=(
+            "For CNN/CNN+LSTM, estimate normalization from all pixels instead of train-fold "
+            "nonzero foreground values, and do not reset zero background to 0 after normalization."
+        ),
+    )
     parser.add_argument("--num-workers", type=int, default=BenchmarkConfig.num_workers, help="PyTorch DataLoader worker count.")
     parser.add_argument("--frame-rate-hz", type=float, default=None, help="Optional frame-rate override passed to within_session.py.")
     parser.add_argument("--variance-to-keep", type=float, default=BenchmarkConfig.variance_to_keep, help="PCA explained variance fraction.")
@@ -1835,6 +1983,10 @@ def main(argv: list[str] | None = None) -> int:
         deep_hidden_dim=args.deep_hidden_dim,
         deep_dropout=args.deep_dropout,
         use_class_weights=not args.no_class_weights,
+        deep_foreground_mode=args.deep_foreground_mode,
+        foreground_epsilon=args.foreground_epsilon,
+        foreground_margin=args.foreground_margin,
+        normalize_foreground_only=not args.normalize_all_pixels,
         device=args.device,
         num_workers=args.num_workers,
         frame_rate_hz=args.frame_rate_hz,
