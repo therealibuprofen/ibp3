@@ -57,6 +57,10 @@ class BenchmarkConfig:
     patience: int = 15
     validation_fraction: float = 0.2
     epoch_log_interval: int = 10
+    cnn_spatial_pool: int = 4
+    deep_hidden_dim: int = 64
+    deep_dropout: float = 0.2
+    use_class_weights: bool = True
     device: str = "auto"
     num_workers: int = 0
     frame_rate_hz: float | None = None
@@ -596,13 +600,22 @@ def _make_validation_split(
     return train_idx[inner_train_local], train_idx[val_local], "stratified_train_validation"
 
 
-def _build_model(model_name: str, task_type: str, input_frames: int, height: int, width: int) -> Any:
+def _build_model(
+    model_name: str,
+    task_type: str,
+    input_frames: int,
+    height: int,
+    width: int,
+    config: BenchmarkConfig,
+) -> Any:
     torch = _require("torch")
     nn = torch.nn
 
     class ConvEncoder(nn.Module):
         def __init__(self, in_channels: int) -> None:
             super().__init__()
+            pool = max(1, int(config.cnn_spatial_pool))
+            self.output_dim = 32 * pool * pool
             self.net = nn.Sequential(
                 nn.Conv2d(in_channels, 16, kernel_size=3, padding=1),
                 nn.GroupNorm(4, 16),
@@ -611,7 +624,7 @@ def _build_model(model_name: str, task_type: str, input_frames: int, height: int
                 nn.Conv2d(16, 32, kernel_size=3, padding=1),
                 nn.GroupNorm(8, 32),
                 nn.ReLU(inplace=True),
-                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.AdaptiveAvgPool2d((pool, pool)),
                 nn.Flatten(),
             )
 
@@ -622,14 +635,19 @@ def _build_model(model_name: str, task_type: str, input_frames: int, height: int
         def __init__(self) -> None:
             super().__init__()
             self.encoder = ConvEncoder(input_frames)
+            self.project = nn.Sequential(
+                nn.Linear(self.encoder.output_dim, int(config.deep_hidden_dim)),
+                nn.ReLU(inplace=True),
+                nn.Dropout(float(config.deep_dropout)),
+            )
             if task_type == "8target":
-                self.head_h = nn.Linear(32, 3)
-                self.head_v = nn.Linear(32, 3)
+                self.head_h = nn.Linear(int(config.deep_hidden_dim), 3)
+                self.head_v = nn.Linear(int(config.deep_hidden_dim), 3)
             else:
-                self.head = nn.Linear(32, 2)
+                self.head = nn.Linear(int(config.deep_hidden_dim), 2)
 
         def forward(self, x: Any) -> Any:
-            z = self.encoder(x)
+            z = self.project(self.encoder(x))
             if task_type == "8target":
                 return self.head_h(z), self.head_v(z)
             return self.head(z)
@@ -638,18 +656,29 @@ def _build_model(model_name: str, task_type: str, input_frames: int, height: int
         def __init__(self) -> None:
             super().__init__()
             self.frame_encoder = ConvEncoder(1)
-            self.lstm = nn.LSTM(input_size=32, hidden_size=32, num_layers=1, batch_first=True)
+            self.frame_project = nn.Sequential(
+                nn.Linear(self.frame_encoder.output_dim, int(config.deep_hidden_dim)),
+                nn.ReLU(inplace=True),
+            )
+            self.lstm = nn.LSTM(
+                input_size=int(config.deep_hidden_dim),
+                hidden_size=int(config.deep_hidden_dim),
+                num_layers=1,
+                batch_first=True,
+            )
+            self.dropout = nn.Dropout(float(config.deep_dropout))
             if task_type == "8target":
-                self.head_h = nn.Linear(32, 3)
-                self.head_v = nn.Linear(32, 3)
+                self.head_h = nn.Linear(int(config.deep_hidden_dim), 3)
+                self.head_v = nn.Linear(int(config.deep_hidden_dim), 3)
             else:
-                self.head = nn.Linear(32, 2)
+                self.head = nn.Linear(int(config.deep_hidden_dim), 2)
 
         def forward(self, x: Any) -> Any:
             b, t, c, h, w = x.shape
-            z = self.frame_encoder(x.reshape(b * t, c, h, w)).reshape(b, t, -1)
+            z = self.frame_encoder(x.reshape(b * t, c, h, w))
+            z = self.frame_project(z).reshape(b, t, -1)
             out, _ = self.lstm(z)
-            last = out[:, -1, :]
+            last = self.dropout(out[:, -1, :])
             if task_type == "8target":
                 return self.head_h(last), self.head_v(last)
             return self.head(last)
@@ -661,17 +690,65 @@ def _build_model(model_name: str, task_type: str, input_frames: int, height: int
     raise ValueError(model_name)
 
 
-def _deep_loss(outputs: Any, batch: tuple[Any, ...], task_type: str) -> Any:
+def _class_weights_from_labels(labels: np.ndarray, n_classes: int, device: str) -> Any:
     torch = _require("torch")
+    labels = np.asarray(labels, dtype=int).reshape(-1)
+    counts = np.bincount(labels[(labels >= 0) & (labels < n_classes)], minlength=n_classes).astype(float)
+    weights = np.ones(n_classes, dtype=np.float32)
+    present = counts > 0
+    if np.any(present):
+        weights[present] = float(counts[present].sum()) / (float(np.sum(present)) * counts[present])
+        weights = weights / float(weights[present].mean())
+    return torch.as_tensor(weights, dtype=torch.float32, device=device)
+
+
+def _make_deep_class_weights(
+    *,
+    y: np.ndarray,
+    labels_axis: np.ndarray | None,
+    train_idx: np.ndarray,
+    task_type: str,
+    device: str,
+    enabled: bool,
+) -> dict[str, Any]:
+    if not enabled:
+        return {}
+    if task_type == "8target":
+        if labels_axis is None:
+            raise ValueError("8-target class weights require axis labels.")
+        return {
+            "horizontal": _class_weights_from_labels(labels_axis[train_idx, 0] - 1, 3, device),
+            "vertical": _class_weights_from_labels(labels_axis[train_idx, 1] - 1, 3, device),
+        }
+    return {"combined": _class_weights_from_labels(y[train_idx], 2, device)}
+
+
+def _deep_loss(outputs: Any, batch: tuple[Any, ...], task_type: str, class_weights: dict[str, Any] | None = None) -> Any:
+    torch = _require("torch")
+    class_weights = class_weights or {}
     if task_type == "8target":
         logits_h, logits_v = outputs
         _, y_h, y_v = batch
-        return torch.nn.functional.cross_entropy(logits_h, y_h) + torch.nn.functional.cross_entropy(logits_v, y_v)
+        return torch.nn.functional.cross_entropy(
+            logits_h,
+            y_h,
+            weight=class_weights.get("horizontal"),
+        ) + torch.nn.functional.cross_entropy(
+            logits_v,
+            y_v,
+            weight=class_weights.get("vertical"),
+        )
     _, y = batch
-    return torch.nn.functional.cross_entropy(outputs, y)
+    return torch.nn.functional.cross_entropy(outputs, y, weight=class_weights.get("combined"))
 
 
-def _evaluate_deep(model: Any, loader: Any, task_type: str, device: str) -> tuple[float, float]:
+def _evaluate_deep(
+    model: Any,
+    loader: Any,
+    task_type: str,
+    device: str,
+    class_weights: dict[str, Any] | None = None,
+) -> tuple[float, float]:
     torch = _require("torch")
     model.eval()
     total_loss = 0.0
@@ -682,7 +759,7 @@ def _evaluate_deep(model: Any, loader: Any, task_type: str, device: str) -> tupl
             batch = tuple(item.to(device) for item in batch)
             x = batch[0]
             outputs = model(x)
-            loss = _deep_loss(outputs, batch, task_type)
+            loss = _deep_loss(outputs, batch, task_type, class_weights)
             n = int(x.shape[0])
             total_loss += float(loss.item()) * n
             total += n
@@ -787,7 +864,15 @@ def _deep_train_predict_fold(
     test_loader = data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=config.num_workers)
 
     _, t_frames, h, w = x_frames.shape
-    model = _build_model(model_name, task_type, t_frames, h, w).to(device)
+    model = _build_model(model_name, task_type, t_frames, h, w, config).to(device)
+    class_weights = _make_deep_class_weights(
+        y=y,
+        labels_axis=labels_axis,
+        train_idx=inner_train_idx,
+        task_type=task_type,
+        device=device,
+        enabled=bool(config.use_class_weights),
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     best_state = None
     best_score = float("inf")
@@ -803,7 +888,7 @@ def _deep_train_predict_fold(
             batch = tuple(item.to(device) for item in batch)
             optimizer.zero_grad(set_to_none=True)
             outputs = model(batch[0])
-            loss = _deep_loss(outputs, batch, task_type)
+            loss = _deep_loss(outputs, batch, task_type, class_weights)
             loss.backward()
             optimizer.step()
             n = int(batch[0].shape[0])
@@ -811,7 +896,7 @@ def _deep_train_predict_fold(
             total += n
         train_loss = total_loss / total if total else float("nan")
         if val_loader is not None:
-            val_loss, val_acc = _evaluate_deep(model, val_loader, task_type, device)
+            val_loss, val_acc = _evaluate_deep(model, val_loader, task_type, device, class_weights)
             monitor = val_loss
         else:
             val_loss, val_acc = float("nan"), float("nan")
@@ -862,6 +947,14 @@ def _deep_train_predict_fold(
         "device": device,
         "batch_size": int(batch_size),
         "validation_strategy": val_strategy,
+        "cnn_spatial_pool": int(config.cnn_spatial_pool),
+        "deep_hidden_dim": int(config.deep_hidden_dim),
+        "deep_dropout": float(config.deep_dropout),
+        "use_class_weights": bool(config.use_class_weights),
+        "class_weights": {
+            key: value.detach().cpu().numpy().astype(float).tolist()
+            for key, value in class_weights.items()
+        },
     }
     return pred
 
@@ -1014,6 +1107,13 @@ def run_window_benchmark(
                     "error_message": error_message,
                     "class_distribution_train": _distribution_dict(y[train_idx]),
                     "class_distribution_test": _distribution_dict(y[test_idx]),
+                    "predicted_distribution": _distribution_dict(pred_result["pred_combined"]),
+                    "predicted_horizontal_distribution": _distribution_dict(pred_result["pred_horizontal"])
+                    if pred_result.get("pred_horizontal") is not None
+                    else {},
+                    "predicted_vertical_distribution": _distribution_dict(pred_result["pred_vertical"])
+                    if pred_result.get("pred_vertical") is not None
+                    else {},
                     "train_indices_local": train_idx.astype(int).tolist(),
                     "test_indices_local": test_idx.astype(int).tolist(),
                     "train_trial_indices_global": window.trial_indices_global[train_idx].astype(int).tolist(),
@@ -1412,6 +1512,9 @@ def run_benchmark(
         "error_message",
         "class_distribution_train",
         "class_distribution_test",
+        "predicted_distribution",
+        "predicted_horizontal_distribution",
+        "predicted_vertical_distribution",
         "train_trial_indices_global",
         "test_trial_indices_global",
     ]
@@ -1619,7 +1722,10 @@ def _normalize_cli_argv(argv: list[str] | None) -> list[str] | None:
         cleaned = str(arg).strip()
         if not cleaned or cleaned == "\\":
             continue
-        out.append(cleaned)
+        if " " in cleaned and (" --" in cleaned or cleaned.startswith("--")):
+            out.extend(part for part in cleaned.split() if part and part != "\\")
+        else:
+            out.append(cleaned)
     return out
 
 
@@ -1651,6 +1757,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patience", type=int, default=BenchmarkConfig.patience, help="Early stopping patience on inner validation loss.")
     parser.add_argument("--validation-fraction", type=float, default=BenchmarkConfig.validation_fraction, help="Fraction of outer-training trials held out for validation.")
     parser.add_argument("--epoch-log-interval", type=int, default=BenchmarkConfig.epoch_log_interval, help="Log deep-model training progress every N epochs; set 0 to disable.")
+    parser.add_argument(
+        "--cnn-spatial-pool",
+        type=int,
+        default=BenchmarkConfig.cnn_spatial_pool,
+        help=(
+            "CNN adaptive spatial pooling size. 4 preserves coarse fUS spatial layout; "
+            "1 is global pooling and is more likely to collapse on small 8-target data."
+        ),
+    )
+    parser.add_argument(
+        "--deep-hidden-dim",
+        type=int,
+        default=BenchmarkConfig.deep_hidden_dim,
+        help="Hidden feature dimension for CNN and CNN+LSTM heads.",
+    )
+    parser.add_argument(
+        "--deep-dropout",
+        type=float,
+        default=BenchmarkConfig.deep_dropout,
+        help="Dropout probability before the deep-model classifier heads.",
+    )
+    parser.add_argument(
+        "--no-class-weights",
+        action="store_true",
+        help="Disable train-fold class weights for CNN/CNN+LSTM losses.",
+    )
     parser.add_argument("--num-workers", type=int, default=BenchmarkConfig.num_workers, help="PyTorch DataLoader worker count.")
     parser.add_argument("--frame-rate-hz", type=float, default=None, help="Optional frame-rate override passed to within_session.py.")
     parser.add_argument("--variance-to-keep", type=float, default=BenchmarkConfig.variance_to_keep, help="PCA explained variance fraction.")
@@ -1699,6 +1831,10 @@ def main(argv: list[str] | None = None) -> int:
         patience=args.patience,
         validation_fraction=args.validation_fraction,
         epoch_log_interval=args.epoch_log_interval,
+        cnn_spatial_pool=args.cnn_spatial_pool,
+        deep_hidden_dim=args.deep_hidden_dim,
+        deep_dropout=args.deep_dropout,
+        use_class_weights=not args.no_class_weights,
         device=args.device,
         num_workers=args.num_workers,
         frame_rate_hz=args.frame_rate_hz,
