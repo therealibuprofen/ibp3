@@ -22,6 +22,7 @@ import sys
 import time
 import traceback
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,7 @@ class BenchmarkConfig:
     detrend_window: int = 50
     spatial_filter_radius: int = 2
     direct_8class: bool = False
+    merge_existing: bool = True
 
 
 @dataclass
@@ -1121,6 +1123,77 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> Non
             writer.writerow({field: _csv_value(row.get(field, "")) for field in fields})
 
 
+def _merge_existing_result_by_model(
+    *,
+    result: dict[str, Any],
+    json_path: Path,
+    current_models: tuple[str, ...],
+    session_id: str,
+    task_type: str,
+    chance_accuracy: float,
+) -> dict[str, Any]:
+    """Preserve previous benchmark rows for models not run this time.
+
+    This lets users run expensive models separately into the same output
+    directory without losing earlier model results. Rows for models requested
+    in the current invocation are replaced, so rerunning one model updates it
+    cleanly instead of duplicating stale folds.
+    """
+
+    if not json_path.exists():
+        result["merged_existing_result"] = False
+        return result
+
+    try:
+        existing = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        LOGGER.warning("Could not merge existing benchmark JSON %s: %s", json_path, exc)
+        result["merged_existing_result"] = False
+        result["merge_warning"] = f"Could not read existing result: {exc}"
+        return result
+
+    current = set(current_models)
+    old_folds = existing.get("folds", [])
+    old_details = existing.get("details", [])
+    preserved_folds = [
+        row for row in old_folds
+        if isinstance(row, dict) and row.get("model") not in current
+    ]
+    preserved_details = [
+        row for row in old_details
+        if isinstance(row, dict) and row.get("model") and row.get("model") not in current
+    ]
+
+    if preserved_folds:
+        LOGGER.info(
+            "Merging existing benchmark result %s; preserving models: %s",
+            json_path,
+            sorted({str(row.get("model")) for row in preserved_folds}),
+        )
+
+    result["folds"] = preserved_folds + result.get("folds", [])
+    result["details"] = preserved_details + result.get("details", [])
+    result["summary"] = build_summary_rows(
+        session_id=session_id,
+        task_type=task_type,
+        fold_rows=result["folds"],
+        chance_accuracy=chance_accuracy,
+    )
+    history = existing.get("run_history", [])
+    if not isinstance(history, list):
+        history = []
+    history.append(
+        {
+            "merged_at_utc": datetime.now(timezone.utc).isoformat(),
+            "current_models_replaced": sorted(current),
+            "preserved_models": sorted({str(row.get("model")) for row in preserved_folds}),
+        }
+    )
+    result["run_history"] = history
+    result["merged_existing_result"] = bool(preserved_folds or preserved_details)
+    return result
+
+
 def environment_info(device: str) -> dict[str, Any]:
     info = {
         "python": sys.version,
@@ -1283,6 +1356,17 @@ def run_benchmark(
     json_path = output_dir / f"{session_id}_benchmark.json"
     summary_path = output_dir / f"{session_id}_benchmark_summary.csv"
     folds_path = output_dir / f"{session_id}_benchmark_folds.csv"
+    if config.merge_existing:
+        result = _merge_existing_result_by_model(
+            result=result,
+            json_path=json_path,
+            current_models=tuple(config.models),
+            session_id=session_id,
+            task_type=task_type,
+            chance_accuracy=chance,
+        )
+        all_fold_rows = result["folds"]
+        summary_rows = result["summary"]
     with json_path.open("w", encoding="utf-8") as handle:
         json.dump(_jsonable(result), handle, indent=2, ensure_ascii=False, allow_nan=False)
 
@@ -1537,6 +1621,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-motion-correction", action="store_true", help="Disable motion-correction check in preprocessing.")
     parser.add_argument("--no-detrend", action="store_true", help="Disable causal detrending in preprocessing.")
     parser.add_argument("--no-spatial-filter", action="store_true", help="Disable pillbox spatial filtering in preprocessing.")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing benchmark JSON/CSV instead of merging by model.")
     parser.add_argument("--self-test", action="store_true", help="Run synthetic benchmark tests instead of a real MAT file.")
     return parser
 
@@ -1574,6 +1659,7 @@ def main(argv: list[str] | None = None) -> int:
         apply_motion_correction=not args.no_motion_correction,
         detrend_window=0 if args.no_detrend else BenchmarkConfig.detrend_window,
         spatial_filter_radius=0 if args.no_spatial_filter else BenchmarkConfig.spatial_filter_radius,
+        merge_existing=not args.overwrite,
     )
     run_benchmark(args.mat_path, config, core_script=args.core_script)
     return 0
