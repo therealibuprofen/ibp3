@@ -1057,6 +1057,13 @@ def build_summary_rows(
     for model in models:
         rows = [row for row in fold_rows if row["model"] == model]
         acc_mean, acc_std = _mean_std(rows, "accuracy")
+        ok_rows = [row for row in rows if row.get("status") == "ok"]
+        n_test_total = sum(int(row.get("n_test", 0)) for row in ok_rows)
+        accuracy_pooled = (
+            float(sum(float(row.get("accuracy", 0.0)) * int(row.get("n_test", 0)) for row in ok_rows) / n_test_total)
+            if n_test_total > 0
+            else float("nan")
+        )
         bal_mean, bal_std = _mean_std(rows, "balanced_accuracy")
         f1_mean, f1_std = _mean_std(rows, "macro_f1")
         ang_mean, _ = _mean_std(rows, "mean_angular_error_deg")
@@ -1071,6 +1078,7 @@ def build_summary_rows(
                 "n_folds": len({int(row["fold"]) for row in rows}),
                 "n_success": sum(row["status"] == "ok" for row in rows),
                 "n_failed": sum(row["status"] != "ok" for row in rows),
+                "accuracy_pooled": accuracy_pooled,
                 "accuracy_mean": acc_mean,
                 "accuracy_std": acc_std,
                 "balanced_accuracy_mean": bal_mean,
@@ -1408,6 +1416,7 @@ def run_benchmark(
         "n_folds",
         "n_success",
         "n_failed",
+        "accuracy_pooled",
         "accuracy_mean",
         "accuracy_std",
         "balanced_accuracy_mean",

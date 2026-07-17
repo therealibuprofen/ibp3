@@ -669,7 +669,21 @@ def align_fusi_and_behavior(
             metadata_for_inference["nTargets"] = inferred_n_targets
 
     file_rate, file_rate_source = _get_file_frame_rate(session)
-    explicit_rate = frame_rate_hz if frame_rate_hz is not None else file_rate
+    ignored_file_rate: float | None = None
+    ignored_file_rate_source: str | None = None
+    use_file_rate = file_rate
+    use_file_rate_source = file_rate_source
+    if frame_rate_hz is None and "iDop" in session and file_rate is not None:
+        # Task-aligned iDop arrays are already sampled onto the behavioral
+        # decoding frame grid. Some files also carry UF/coreParams hardware
+        # acquisition rates (for example 500 Hz), which are not the frame rate
+        # of the task-aligned iDop time axis. Prefer ProjectRecord defaults for
+        # these files unless the user explicitly overrides --frame-rate-hz.
+        ignored_file_rate = float(file_rate)
+        ignored_file_rate_source = file_rate_source
+        use_file_rate = None
+        use_file_rate_source = None
+    explicit_rate = frame_rate_hz if frame_rate_hz is not None else use_file_rate
     task_config = infer_task_config(
         metadata_for_inference,
         frame_rate_hz=explicit_rate,
@@ -677,8 +691,8 @@ def align_fusi_and_behavior(
     )
     if frame_rate_hz is not None:
         task_config.frame_rate_source = "user"
-    elif file_rate is not None:
-        task_config.frame_rate_source = file_rate_source or "file"
+    elif use_file_rate is not None:
+        task_config.frame_rate_source = use_file_rate_source or "file"
     frame_rate = task_config.frame_rate_hz
 
     continuous_log: dict[str, Any] = {}
@@ -727,6 +741,8 @@ def align_fusi_and_behavior(
         "cue_reference": cue_name,
         "frame_rate_hz": float(frame_rate),
         "frame_rate_source": task_config.frame_rate_source,
+        "ignored_file_frame_rate_hz": ignored_file_rate,
+        "ignored_file_frame_rate_source": ignored_file_rate_source,
         "recording_system": task_config.recording_system,
         "project_record_path": task_config.project_record_path,
         "task_type": task_config.task_type,
