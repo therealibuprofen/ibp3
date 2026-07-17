@@ -118,6 +118,8 @@ def _torch_available() -> bool:
 
 
 def _select_device(requested: str) -> str:
+    if requested == "gpu":
+        requested = "cuda"
     if requested != "auto":
         return requested
     if not _torch_available():
@@ -445,6 +447,8 @@ def _linear_predict_fold(
     if task_type == "8target":
         if labels_axis_train is None:
             raise ValueError("8-target linear decoding requires horizontal/vertical axis labels.")
+        h_cpca_m = max(int(config.cpca_m), int(np.unique(labels_axis_train[:, 0]).size) - 1)
+        v_cpca_m = max(int(config.cpca_m), int(np.unique(labels_axis_train[:, 1]).size) - 1)
         if model_name == "pca_lda":
             h_pred, h_comp, h_zero = core.fit_fold_scaler_pca_lda(
                 x_train, labels_axis_train[:, 0], x_test, config.variance_to_keep
@@ -459,7 +463,7 @@ def _linear_predict_fold(
                 x_test,
                 variance_to_keep=config.variance_to_keep,
                 decoder_type="cpca_lda",
-                cpca_m=config.cpca_m,
+                cpca_m=h_cpca_m,
                 random_seed=seed,
             )
             v_pred, v_comp, v_zero = core.fit_fold_scaler_projection_lda(
@@ -468,7 +472,7 @@ def _linear_predict_fold(
                 x_test,
                 variance_to_keep=config.variance_to_keep,
                 decoder_type="cpca_lda",
-                cpca_m=config.cpca_m,
+                cpca_m=v_cpca_m,
                 random_seed=seed + 1,
             )
         else:
@@ -479,6 +483,9 @@ def _linear_predict_fold(
             "components_vertical": int(v_comp),
             "zero_std_features_horizontal": int(h_zero),
             "zero_std_features_vertical": int(v_zero),
+            "requested_cpca_m": int(config.cpca_m),
+            "effective_cpca_m_horizontal": int(h_cpca_m) if model_name == "cpca_lda" else None,
+            "effective_cpca_m_vertical": int(v_cpca_m) if model_name == "cpca_lda" else None,
         }
         return {
             "pred_combined": pred,
@@ -1159,12 +1166,24 @@ def run_benchmark(
         raise ValueError(f"Unsupported models: {unknown}. Choose from {ALL_MODELS} or 'all'.")
     if config.direct_8class:
         raise NotImplementedError("Direct 8-class CNN mode is intentionally not the default benchmark path.")
+    if config.device == "gpu":
+        config.device = "cuda"
     if any(model in DEEP_MODELS for model in config.models) and not _torch_available():
         raise ImportError(
             "CNN/CNN+LSTM models require PyTorch in the same Python environment that runs "
             f"this script. Current executable: {sys.executable}. Install with "
             "'python -m pip install torch' using that executable, or omit cnn/cnn_lstm."
         )
+    if any(model in DEEP_MODELS for model in config.models) and config.device == "cuda":
+        torch = _require("torch")
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "You requested --device cuda, but PyTorch cannot initialize CUDA in this environment. "
+                "This is usually a driver/PyTorch CUDA build mismatch. Run `nvidia-smi` and "
+                "`python -c \"import torch; print(torch.version.cuda, torch.cuda.is_available())\"`, "
+                "then either update the NVIDIA driver, install a PyTorch build compatible with that "
+                "driver, or rerun with --device cpu."
+            )
 
     core = load_core_module(core_script)
     mat_path = Path(mat_path)

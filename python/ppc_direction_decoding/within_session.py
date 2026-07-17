@@ -244,6 +244,16 @@ def load_mat73_session(mat_path: str | Path) -> dict[str, Any]:
                 f"or still copying. Current size is {actual_size} bytes. Re-copy or "
                 "re-download the file, wait for the transfer to finish, then rerun decoding."
             ) from exc
+        if "file signature not found" in message.lower():
+            actual_size = mat_path.stat().st_size if mat_path.exists() else 0
+            raise OSError(
+                f"Cannot open '{mat_path}' as MATLAB v7.3/HDF5. h5py reported "
+                f"'file signature not found' and the current file size is {actual_size} bytes. "
+                "This usually means the path points to a non-v7.3 MAT file, a text/HTML/placeholder "
+                "file, or a corrupted/incomplete copy. On the server, check it with "
+                "`ls -lh`, `file`, and `head -c 8 <path> | xxd`; a valid HDF5 MAT file should "
+                "start with the HDF5 signature."
+            ) from exc
         raise
     out["_source_path"] = str(mat_path)
     return out
@@ -1338,6 +1348,7 @@ def _matlab_principal_components(data: np.ndarray) -> tuple[np.ndarray, np.ndarr
         if eval_raw.size == 0:
             return np.empty((n_features, 0), dtype=float), np.empty(0, dtype=float)
         coeff = demeaned.T @ sample_vecs @ np.diag(eval_raw ** -0.5)
+        coeff = np.nan_to_num(coeff, nan=0.0, posinf=0.0, neginf=0.0)
         latent = eval_raw / (n_obs - 1)
     else:
         scatter = demeaned.T @ demeaned
@@ -1349,6 +1360,7 @@ def _matlab_principal_components(data: np.ndarray) -> tuple[np.ndarray, np.ndarr
         tol = max(scatter.shape) * np.finfo(float).eps * max(float(np.max(np.abs(eval_raw))), 1.0)
         keep = eval_raw > tol
         coeff = coeff[:, keep]
+        coeff = np.nan_to_num(coeff, nan=0.0, posinf=0.0, neginf=0.0)
         latent = latent[keep]
 
     return np.asarray(coeff, dtype=float), np.asarray(latent, dtype=float)
