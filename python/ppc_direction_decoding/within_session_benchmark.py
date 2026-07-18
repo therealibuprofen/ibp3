@@ -61,6 +61,10 @@ class BenchmarkConfig:
     deep_hidden_dim: int = 64
     deep_dropout: float = 0.2
     use_class_weights: bool = True
+    voxel_mask_percentile: float = 20.0
+    voxel_mask_min_fraction: float = 0.05
+    deep_train_mask_percentile: float = 20.0
+    deep_train_mask_min_fraction: float = 0.05
     deep_foreground_mode: str = "crop"
     foreground_epsilon: float = 1e-8
     foreground_margin: int = 2
@@ -343,6 +347,103 @@ def _window_frame_tensor(
     return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
 
 
+def _power_doppler_voxel_mask(
+    values: np.ndarray,
+    *,
+    percentile: float,
+    min_fraction: float,
+    candidate_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Build an anatomical/angiogram-like mask from mean Power Doppler strength."""
+
+    arr = np.nan_to_num(np.asarray(values, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    if arr.ndim < 3:
+        raise ValueError(f"Cannot build voxel mask from array with shape {arr.shape}")
+    height, width = arr.shape[:2]
+    samples = arr.reshape(height, width, -1)
+    mean_power = np.mean(np.abs(samples), axis=2)
+    stability = mean_power / (np.std(samples, axis=2) + 1e-6)
+    if candidate_mask is None:
+        candidate = np.ones((height, width), dtype=bool)
+    else:
+        candidate = np.asarray(candidate_mask, dtype=bool)
+        if candidate.shape != (height, width):
+            raise ValueError(f"candidate_mask shape {candidate.shape} does not match frame shape {(height, width)}")
+    positive = (mean_power > 0) & candidate
+    n_pixels = int(height * width)
+    n_candidate = int(candidate.sum())
+    min_pixels = max(1, int(math.ceil(float(min_fraction) * max(1, n_candidate))))
+
+    info: dict[str, Any] = {
+        "method": "mean_power_doppler_percentile",
+        "percentile": float(percentile),
+        "min_fraction": float(min_fraction),
+        "n_pixels": n_pixels,
+        "n_candidate_pixels": n_candidate,
+        "n_positive_power_pixels": int(positive.sum()),
+        "mean_power_min": float(mean_power[positive].min()) if np.any(positive) else 0.0,
+        "mean_power_max": float(mean_power[candidate].max()) if np.any(candidate) else 0.0,
+        "stability_mean": float(stability[positive].mean()) if np.any(positive) else 0.0,
+    }
+
+    if not np.any(positive):
+        mask = candidate.copy()
+        info.update({"threshold": 0.0, "status": "empty_power_fallback_candidate_mask"})
+    else:
+        candidate_values = mean_power[positive]
+        threshold = float(np.percentile(candidate_values, float(percentile)))
+        mask = (mean_power >= threshold) & candidate
+        if int(mask.sum()) < min_pixels:
+            flat = np.where(candidate, mean_power, -np.inf).reshape(-1)
+            keep = min(min_pixels, int(np.count_nonzero(np.isfinite(flat) & (flat > 0))))
+            if keep > 0:
+                selected = np.argpartition(flat, -keep)[-keep:]
+                mask = np.zeros_like(flat, dtype=bool)
+                mask[selected] = True
+                mask = mask.reshape(height, width)
+                info["status"] = "top_power_min_fraction"
+            else:
+                mask = candidate.copy()
+                info["status"] = "too_few_positive_fallback_candidate_mask"
+        else:
+            info["status"] = "percentile_threshold"
+        info["threshold"] = threshold
+
+    info["n_mask_pixels"] = int(mask.sum())
+    info["mask_fraction"] = float(mask.mean()) if mask.size else 0.0
+    return mask.astype(bool, copy=False), info
+
+
+def _window_power_mask(
+    images: np.ndarray,
+    trial_indices: np.ndarray,
+    frame_indices: np.ndarray,
+    *,
+    percentile: float,
+    min_fraction: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    stack = images[:, :, np.asarray(frame_indices, dtype=int), :][:, :, :, np.asarray(trial_indices, dtype=int)]
+    return _power_doppler_voxel_mask(stack, percentile=percentile, min_fraction=min_fraction)
+
+
+def _train_fold_power_mask(
+    x_train_frames: np.ndarray,
+    candidate_mask: np.ndarray,
+    *,
+    percentile: float,
+    min_fraction: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    stack = np.transpose(np.asarray(x_train_frames, dtype=np.float32), (2, 3, 1, 0))
+    mask, info = _power_doppler_voxel_mask(
+        stack,
+        percentile=percentile,
+        min_fraction=min_fraction,
+        candidate_mask=candidate_mask,
+    )
+    info["source"] = "inner_train_mean_power_doppler"
+    return mask, info
+
+
 def prepare_benchmark_windows(
     *,
     core: Any,
@@ -394,7 +495,6 @@ def prepare_benchmark_windows(
         raise ValueError(f"Unsupported mode '{config.mode}'")
 
     prepared: list[PreparedWindow] = []
-    dynamic_voxel_mask = np.isfinite(images).all(axis=(2, 3)) if config.mode == "dynamic_time_window" else None
     for window_mode, eval_index in decode_windows:
         if window_mode == "fixed_memory_3frames":
             memory_end_index = core._memory_end_frame_index(aligned)
@@ -403,7 +503,14 @@ def prepare_benchmark_windows(
                 raise ValueError("Cannot build fixed_memory_3frames features: fewer than 3 frames exist.")
             frame_indices = np.arange(start, memory_end_index, dtype=int)
             trial_ok = np.asarray(valid_mask, dtype=bool)
-            voxel_mask = np.isfinite(images[:, :, frame_indices, :][:, :, :, trial_ok]).any(axis=(2, 3))
+            candidate_trials = np.flatnonzero(trial_ok)
+            voxel_mask, voxel_mask_info = _window_power_mask(
+                images,
+                candidate_trials,
+                frame_indices,
+                percentile=config.voxel_mask_percentile,
+                min_fraction=config.voxel_mask_min_fraction,
+            )
             x_flat, trial_indices, winfo = core.build_fixed_memory_3frames_features(
                 images, aligned, valid_mask, voxel_mask=voxel_mask
             )
@@ -413,8 +520,14 @@ def prepare_benchmark_windows(
                 frame_indices = np.arange(0, eval_index + 1, dtype=int)
             else:
                 frame_indices = np.arange(aligned.cue_index, eval_index + 1, dtype=int)
-            assert dynamic_voxel_mask is not None
-            voxel_mask = dynamic_voxel_mask
+            candidate_trials = np.flatnonzero(np.asarray(valid_mask, dtype=bool))
+            voxel_mask, voxel_mask_info = _window_power_mask(
+                images,
+                candidate_trials,
+                frame_indices,
+                percentile=config.voxel_mask_percentile,
+                min_fraction=config.voxel_mask_min_fraction,
+            )
             x_flat, trial_indices, winfo = core.build_dynamic_window_features(
                 images,
                 int(eval_index),
@@ -426,6 +539,7 @@ def prepare_benchmark_windows(
         if trial_indices.size < config.min_trials_per_timepoint:
             LOGGER.warning("Skipping window %s: only %d trials", window_mode, trial_indices.size)
             continue
+        winfo["voxel_mask_info"] = voxel_mask_info
         x_frames = _window_frame_tensor(images, trial_indices, winfo["frame_indices"], voxel_mask)
         labels_combined = combined_all[trial_indices].astype(int)
         labels_axis = axis_all[trial_indices].astype(int) if axis_all is not None else None
@@ -917,18 +1031,35 @@ def _deep_loss(outputs: Any, batch: tuple[Any, ...], task_type: str, class_weigh
     return torch.nn.functional.cross_entropy(outputs, y, weight=class_weights.get("combined"))
 
 
+def _balanced_accuracy_for_labels(y_true: np.ndarray, y_pred: np.ndarray, labels: np.ndarray) -> float:
+    recalls = []
+    y_true = np.asarray(y_true, dtype=int)
+    y_pred = np.asarray(y_pred, dtype=int)
+    for label in np.asarray(labels, dtype=int):
+        mask = y_true == int(label)
+        if np.any(mask):
+            recalls.append(float(np.mean(y_pred[mask] == int(label))))
+    return float(np.mean(recalls)) if recalls else float("nan")
+
+
 def _evaluate_deep(
     model: Any,
     loader: Any,
     task_type: str,
     device: str,
     class_weights: dict[str, Any] | None = None,
-) -> tuple[float, float]:
+) -> dict[str, float]:
     torch = _require("torch")
     model.eval()
     total_loss = 0.0
     total = 0
     correct = 0
+    true_all: list[int] = []
+    pred_all: list[int] = []
+    true_h_all: list[int] = []
+    pred_h_all: list[int] = []
+    true_v_all: list[int] = []
+    pred_v_all: list[int] = []
     with torch.no_grad():
         for batch in loader:
             batch = tuple(item.to(device) for item in batch)
@@ -946,11 +1077,35 @@ def _evaluate_deep(
                 y_v = batch[2] + 1
                 pred = pred_h + 3 * (pred_v - 1)
                 true = y_h + 3 * (y_v - 1)
+                true_h_all.extend(y_h.cpu().numpy().astype(int).tolist())
+                pred_h_all.extend(pred_h.cpu().numpy().astype(int).tolist())
+                true_v_all.extend(y_v.cpu().numpy().astype(int).tolist())
+                pred_v_all.extend(pred_v.cpu().numpy().astype(int).tolist())
             else:
                 pred = torch.argmax(outputs, dim=1)
                 true = batch[1]
             correct += int((pred == true).sum().item())
-    return (total_loss / total if total else float("nan")), (correct / total if total else float("nan"))
+            true_all.extend(true.cpu().numpy().astype(int).tolist())
+            pred_all.extend(pred.cpu().numpy().astype(int).tolist())
+    if task_type == "8target":
+        h_bal = _balanced_accuracy_for_labels(np.asarray(true_h_all), np.asarray(pred_h_all), np.arange(1, 4))
+        v_bal = _balanced_accuracy_for_labels(np.asarray(true_v_all), np.asarray(pred_v_all), np.arange(1, 4))
+        axis_bal = float(np.nanmean([h_bal, v_bal]))
+        labels = np.arange(1, 10)
+    else:
+        h_bal = float("nan")
+        v_bal = float("nan")
+        axis_bal = float("nan")
+        labels = np.arange(0, 2)
+    combined_bal = _balanced_accuracy_for_labels(np.asarray(true_all), np.asarray(pred_all), labels)
+    return {
+        "validation_loss": total_loss / total if total else float("nan"),
+        "validation_accuracy": correct / total if total else float("nan"),
+        "validation_balanced_accuracy": combined_bal,
+        "validation_horizontal_balanced_accuracy": h_bal,
+        "validation_vertical_balanced_accuracy": v_bal,
+        "validation_axis_balanced_accuracy": axis_bal,
+    }
 
 
 def _predict_deep(model: Any, loader: Any, task_type: str, device: str) -> dict[str, Any]:
@@ -1014,11 +1169,18 @@ def _deep_train_predict_fold(
     inner_train_idx, val_idx, val_strategy = _make_validation_split(
         train_idx, y, config.validation_fraction, seed
     )
+    train_voxel_mask, train_voxel_mask_info = _train_fold_power_mask(
+        x_frames[inner_train_idx],
+        np.asarray(voxel_mask, dtype=bool),
+        percentile=config.deep_train_mask_percentile,
+        min_fraction=config.deep_train_mask_min_fraction,
+    )
     spatial_roi = _spatial_roi_from_voxel_mask(
-        voxel_mask,
+        train_voxel_mask,
         mode=config.deep_foreground_mode,
         margin=config.foreground_margin,
     )
+    spatial_roi["train_voxel_mask_info"] = train_voxel_mask_info
     normalization = _normalization_from_train(
         _apply_spatial_roi(x_frames[inner_train_idx], spatial_roi),
         model_name,
@@ -1071,7 +1233,7 @@ def _deep_train_predict_fold(
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     best_state = None
-    best_score = float("inf")
+    best_score: float | None = None
     best_epoch = 0
     epochs_without_improvement = 0
     history = []
@@ -1092,32 +1254,62 @@ def _deep_train_predict_fold(
             total += n
         train_loss = total_loss / total if total else float("nan")
         if val_loader is not None:
-            val_loss, val_acc = _evaluate_deep(model, val_loader, task_type, device, class_weights)
-            monitor = val_loss
+            val_metrics = _evaluate_deep(model, val_loader, task_type, device, class_weights)
+            if task_type == "8target":
+                monitor = val_metrics["validation_axis_balanced_accuracy"]
+                monitor_name = "validation_axis_balanced_accuracy"
+                monitor_mode = "max"
+            else:
+                monitor = val_metrics["validation_balanced_accuracy"]
+                monitor_name = "validation_balanced_accuracy"
+                monitor_mode = "max"
         else:
-            val_loss, val_acc = float("nan"), float("nan")
+            val_metrics = {
+                "validation_loss": float("nan"),
+                "validation_accuracy": float("nan"),
+                "validation_balanced_accuracy": float("nan"),
+                "validation_horizontal_balanced_accuracy": float("nan"),
+                "validation_vertical_balanced_accuracy": float("nan"),
+                "validation_axis_balanced_accuracy": float("nan"),
+            }
             monitor = train_loss
+            monitor_name = "train_loss"
+            monitor_mode = "min"
         history.append(
             {
                 "epoch": int(epoch),
                 "train_loss": float(train_loss),
-                "validation_loss": float(val_loss),
-                "validation_accuracy": float(val_acc),
+                "monitor_name": monitor_name,
+                "monitor_value": float(monitor),
+                **{key: float(value) for key, value in val_metrics.items()},
             }
         )
         if config.epoch_log_interval and (
             epoch == 1 or epoch % int(config.epoch_log_interval) == 0 or epoch == int(config.max_epochs)
         ):
             LOGGER.info(
-                "%s epoch %d/%d train_loss=%.4f val_loss=%s val_acc=%s",
+                "%s epoch %d/%d train_loss=%.4f val_loss=%s val_acc=%s val_axis_bal_acc=%s monitor=%s:%s",
                 model_name,
                 epoch,
                 int(config.max_epochs),
                 train_loss,
-                f"{val_loss:.4f}" if np.isfinite(val_loss) else "nan",
-                f"{val_acc:.4f}" if np.isfinite(val_acc) else "nan",
+                f"{val_metrics['validation_loss']:.4f}" if np.isfinite(val_metrics["validation_loss"]) else "nan",
+                f"{val_metrics['validation_accuracy']:.4f}" if np.isfinite(val_metrics["validation_accuracy"]) else "nan",
+                f"{val_metrics['validation_axis_balanced_accuracy']:.4f}"
+                if np.isfinite(val_metrics["validation_axis_balanced_accuracy"])
+                else "nan",
+                monitor_name,
+                f"{monitor:.4f}" if np.isfinite(monitor) else "nan",
             )
-        if monitor < best_score - 1e-8:
+        if not np.isfinite(monitor):
+            improved = False
+        elif best_score is None:
+            improved = True
+        elif monitor_mode == "max":
+            improved = monitor > best_score + 1e-8
+        else:
+            improved = monitor < best_score - 1e-8
+        if improved:
             best_score = monitor
             best_epoch = int(epoch)
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -1132,6 +1324,8 @@ def _deep_train_predict_fold(
     pred["train_log"] = {
         "training_time": float(time.perf_counter() - t0),
         "best_epoch": int(best_epoch),
+        "best_monitor_name": history[best_epoch - 1]["monitor_name"] if best_epoch > 0 else None,
+        "best_monitor_value": float(best_score) if best_score is not None else None,
         "epochs_run": len(history),
         "validation_strategy": val_strategy,
         "validation_indices_local": val_idx.astype(int).tolist(),
@@ -1301,6 +1495,8 @@ def run_window_benchmark(
                     "top2_accuracy": metrics["top2_accuracy"],
                     "valid_angular_error_count": metrics["valid_angular_error_count"],
                     "best_epoch": train_log.get("best_epoch"),
+                    "best_monitor_name": train_log.get("best_monitor_name"),
+                    "best_monitor_value": train_log.get("best_monitor_value"),
                     "training_time": train_log.get("training_time", 0.0),
                     "status": status,
                     "error_message": error_message,
@@ -1708,6 +1904,8 @@ def run_benchmark(
         "top2_accuracy",
         "valid_angular_error_count",
         "best_epoch",
+        "best_monitor_name",
+        "best_monitor_value",
         "training_time",
         "status",
         "error_message",
@@ -1910,6 +2108,18 @@ def run_synthetic_tests() -> None:
     assert norm["feature_count"] == int(mask.sum()) * 3
     assert float(masked_ds.x[:, :, 0, 0].abs().sum()) == 0.0
 
+    finite_values = np.ones((10, 12, 3, 4), dtype=np.float32) * 0.01
+    finite_values[3:7, 4:8, :, :] = 10.0
+    power_mask, power_info = _power_doppler_voxel_mask(finite_values, percentile=90.0, min_fraction=0.01)
+    assert power_info["method"] == "mean_power_doppler_percentile"
+    assert int(power_mask.sum()) < finite_values.shape[0] * finite_values.shape[1]
+    assert power_mask[4, 5]
+    assert not power_mask[0, 0]
+
+    h_bal = _balanced_accuracy_for_labels(np.array([1, 1, 2, 2, 3, 3]), np.array([1, 2, 2, 2, 1, 3]), np.arange(1, 4))
+    v_bal = _balanced_accuracy_for_labels(np.array([1, 1, 2, 2, 3, 3]), np.array([1, 1, 1, 2, 3, 1]), np.arange(1, 4))
+    assert math.isclose(float(np.nanmean([h_bal, v_bal])), (h_bal + v_bal) / 2.0)
+
     print("Synthetic benchmark tests passed.")
 
 
@@ -1972,7 +2182,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=BenchmarkConfig.learning_rate, help="AdamW learning rate.")
     parser.add_argument("--weight-decay", type=float, default=BenchmarkConfig.weight_decay, help="AdamW weight decay.")
     parser.add_argument("--max-epochs", type=int, default=BenchmarkConfig.max_epochs, help="Maximum CNN training epochs.")
-    parser.add_argument("--patience", type=int, default=BenchmarkConfig.patience, help="Early stopping patience on inner validation loss.")
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=BenchmarkConfig.patience,
+        help=(
+            "Early stopping patience. 8-target deep models monitor validation_axis_balanced_accuracy; "
+            "2-target deep models monitor validation_balanced_accuracy."
+        ),
+    )
     parser.add_argument("--validation-fraction", type=float, default=BenchmarkConfig.validation_fraction, help="Fraction of outer-training trials held out for validation.")
     parser.add_argument("--epoch-log-interval", type=int, default=BenchmarkConfig.epoch_log_interval, help="Log deep-model training progress every N epochs; set 0 to disable.")
     parser.add_argument(
@@ -2002,12 +2220,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable train-fold class weights for CNN/CNN+LSTM losses.",
     )
     parser.add_argument(
+        "--voxel-mask-percentile",
+        type=float,
+        default=BenchmarkConfig.voxel_mask_percentile,
+        help=(
+            "Window-level mask threshold: keep pixels at or above this percentile of "
+            "mean Power Doppler among positive candidate pixels."
+        ),
+    )
+    parser.add_argument(
+        "--voxel-mask-min-fraction",
+        type=float,
+        default=BenchmarkConfig.voxel_mask_min_fraction,
+        help="Minimum fraction of candidate pixels retained in the window-level Power Doppler mask.",
+    )
+    parser.add_argument(
+        "--deep-train-mask-percentile",
+        type=float,
+        default=BenchmarkConfig.deep_train_mask_percentile,
+        help=(
+            "Deep-model fold mask threshold computed from inner-train mean Power Doppler "
+            "inside the window-level mask."
+        ),
+    )
+    parser.add_argument(
+        "--deep-train-mask-min-fraction",
+        type=float,
+        default=BenchmarkConfig.deep_train_mask_min_fraction,
+        help="Minimum fraction of window-mask pixels retained in the deep train-fold mask.",
+    )
+    parser.add_argument(
         "--deep-foreground-mode",
         choices=["crop", "none"],
         default=BenchmarkConfig.deep_foreground_mode,
         help=(
-            "Foreground handling for CNN/CNN+LSTM. 'crop' computes a nonzero-pixel ROI "
-            "from the inner training split only; 'none' keeps the full image."
+            "Foreground handling for CNN/CNN+LSTM. 'crop' computes an ROI from the "
+            "inner-train Power Doppler mask; 'none' keeps the full image."
         ),
     )
     parser.add_argument(
@@ -2085,6 +2333,10 @@ def main(argv: list[str] | None = None) -> int:
         deep_hidden_dim=args.deep_hidden_dim,
         deep_dropout=args.deep_dropout,
         use_class_weights=not args.no_class_weights,
+        voxel_mask_percentile=args.voxel_mask_percentile,
+        voxel_mask_min_fraction=args.voxel_mask_min_fraction,
+        deep_train_mask_percentile=args.deep_train_mask_percentile,
+        deep_train_mask_min_fraction=args.deep_train_mask_min_fraction,
         deep_foreground_mode=args.deep_foreground_mode,
         foreground_epsilon=args.foreground_epsilon,
         foreground_margin=args.foreground_margin,
