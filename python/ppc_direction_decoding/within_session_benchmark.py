@@ -766,53 +766,96 @@ def _build_model(
     class SmallCNN(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.encoder = ConvEncoder(input_frames)
-            self.project = nn.Sequential(
-                nn.Linear(self.encoder.output_dim, int(config.deep_hidden_dim)),
-                nn.ReLU(inplace=True),
-                nn.Dropout(float(config.deep_dropout)),
-            )
             if task_type == "8target":
+                self.encoder_h = ConvEncoder(input_frames)
+                self.encoder_v = ConvEncoder(input_frames)
+                self.project_h = nn.Sequential(
+                    nn.Linear(self.encoder_h.output_dim, int(config.deep_hidden_dim)),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(float(config.deep_dropout)),
+                )
+                self.project_v = nn.Sequential(
+                    nn.Linear(self.encoder_v.output_dim, int(config.deep_hidden_dim)),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(float(config.deep_dropout)),
+                )
                 self.head_h = nn.Linear(int(config.deep_hidden_dim), 3)
                 self.head_v = nn.Linear(int(config.deep_hidden_dim), 3)
             else:
+                self.encoder = ConvEncoder(input_frames)
+                self.project = nn.Sequential(
+                    nn.Linear(self.encoder.output_dim, int(config.deep_hidden_dim)),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(float(config.deep_dropout)),
+                )
                 self.head = nn.Linear(int(config.deep_hidden_dim), 2)
 
         def forward(self, x: Any) -> Any:
-            z = self.project(self.encoder(x))
             if task_type == "8target":
-                return self.head_h(z), self.head_v(z)
+                z_h = self.project_h(self.encoder_h(x))
+                z_v = self.project_v(self.encoder_v(x))
+                return self.head_h(z_h), self.head_v(z_v)
+            z = self.project(self.encoder(x))
             return self.head(z)
 
     class SmallCNNLSTM(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.frame_encoder = ConvEncoder(1)
-            self.frame_project = nn.Sequential(
-                nn.Linear(self.frame_encoder.output_dim, int(config.deep_hidden_dim)),
-                nn.ReLU(inplace=True),
-            )
-            self.lstm = nn.LSTM(
-                input_size=int(config.deep_hidden_dim),
-                hidden_size=int(config.deep_hidden_dim),
-                num_layers=1,
-                batch_first=True,
-            )
             self.dropout = nn.Dropout(float(config.deep_dropout))
             if task_type == "8target":
+                self.frame_encoder_h = ConvEncoder(1)
+                self.frame_encoder_v = ConvEncoder(1)
+                self.frame_project_h = nn.Sequential(
+                    nn.Linear(self.frame_encoder_h.output_dim, int(config.deep_hidden_dim)),
+                    nn.ReLU(inplace=True),
+                )
+                self.frame_project_v = nn.Sequential(
+                    nn.Linear(self.frame_encoder_v.output_dim, int(config.deep_hidden_dim)),
+                    nn.ReLU(inplace=True),
+                )
+                self.lstm_h = nn.LSTM(
+                    input_size=int(config.deep_hidden_dim),
+                    hidden_size=int(config.deep_hidden_dim),
+                    num_layers=1,
+                    batch_first=True,
+                )
+                self.lstm_v = nn.LSTM(
+                    input_size=int(config.deep_hidden_dim),
+                    hidden_size=int(config.deep_hidden_dim),
+                    num_layers=1,
+                    batch_first=True,
+                )
                 self.head_h = nn.Linear(int(config.deep_hidden_dim), 3)
                 self.head_v = nn.Linear(int(config.deep_hidden_dim), 3)
             else:
+                self.frame_encoder = ConvEncoder(1)
+                self.frame_project = nn.Sequential(
+                    nn.Linear(self.frame_encoder.output_dim, int(config.deep_hidden_dim)),
+                    nn.ReLU(inplace=True),
+                )
+                self.lstm = nn.LSTM(
+                    input_size=int(config.deep_hidden_dim),
+                    hidden_size=int(config.deep_hidden_dim),
+                    num_layers=1,
+                    batch_first=True,
+                )
                 self.head = nn.Linear(int(config.deep_hidden_dim), 2)
 
         def forward(self, x: Any) -> Any:
             b, t, c, h, w = x.shape
+            if task_type == "8target":
+                flat = x.reshape(b * t, c, h, w)
+                z_h = self.frame_project_h(self.frame_encoder_h(flat)).reshape(b, t, -1)
+                z_v = self.frame_project_v(self.frame_encoder_v(flat)).reshape(b, t, -1)
+                out_h, _ = self.lstm_h(z_h)
+                out_v, _ = self.lstm_v(z_v)
+                last_h = self.dropout(out_h[:, -1, :])
+                last_v = self.dropout(out_v[:, -1, :])
+                return self.head_h(last_h), self.head_v(last_v)
             z = self.frame_encoder(x.reshape(b * t, c, h, w))
             z = self.frame_project(z).reshape(b, t, -1)
             out, _ = self.lstm(z)
             last = self.dropout(out[:, -1, :])
-            if task_type == "8target":
-                return self.head_h(last), self.head_v(last)
             return self.head(last)
 
     if model_name == "cnn":
@@ -1104,6 +1147,7 @@ def _deep_train_predict_fold(
         "cnn_spatial_pool": int(config.cnn_spatial_pool),
         "deep_hidden_dim": int(config.deep_hidden_dim),
         "deep_dropout": float(config.deep_dropout),
+        "branching": "independent_horizontal_vertical" if task_type == "8target" else "single",
         "use_class_weights": bool(config.use_class_weights),
         "class_weights": {
             key: value.detach().cpu().numpy().astype(float).tolist()
