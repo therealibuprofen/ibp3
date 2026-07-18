@@ -88,6 +88,7 @@ class PreparedWindow:
     eval_index: int
     x_flat: np.ndarray
     x_frames: np.ndarray
+    voxel_mask: np.ndarray
     trial_indices_global: np.ndarray
     window_info: dict[str, Any]
     labels_combined: np.ndarray
@@ -434,6 +435,7 @@ def prepare_benchmark_windows(
                 eval_index=int(winfo["eval_index"]),
                 x_flat=x_flat,
                 x_frames=x_frames,
+                voxel_mask=np.asarray(voxel_mask, dtype=bool),
                 trial_indices_global=trial_indices.astype(int),
                 window_info=winfo,
                 labels_combined=labels_combined,
@@ -546,18 +548,16 @@ class _FrameDataset:
         torch = _require("torch")
         arr = np.asarray(x[indices], dtype=np.float32)
         arr = _apply_spatial_roi(arr, spatial_roi)
-        background = np.abs(arr) <= float(normalization.get("foreground_epsilon", 0.0))
+        valid_mask = np.asarray(normalization["valid_mask"], dtype=bool)
+        invalid = ~valid_mask.reshape(1, 1, *valid_mask.shape)
+        mean = np.asarray(normalization["mean"], dtype=np.float32).reshape(1, *normalization["mean"].shape)
+        std = np.asarray(normalization["std"], dtype=np.float32).reshape(1, *normalization["std"].shape)
+        arr = (arr - mean) / std
+        arr = np.where(invalid, 0.0, arr)
         if model_name == "cnn":
-            mean = np.asarray(normalization["mean"], dtype=np.float32).reshape(1, -1, 1, 1)
-            std = np.asarray(normalization["std"], dtype=np.float32).reshape(1, -1, 1, 1)
-            arr = (arr - mean) / std
+            pass
         else:
-            mean = float(normalization["mean"])
-            std = float(normalization["std"])
-            arr = ((arr - mean) / std)[:, :, None, :, :]
-            background = background[:, :, None, :, :]
-        if normalization.get("foreground_only", False):
-            arr = np.where(background, 0.0, arr)
+            arr = arr[:, :, None, :, :]
         self.x = torch.from_numpy(arr.astype(np.float32, copy=False))
         self.y = torch.from_numpy(np.asarray(y[indices], dtype=np.int64))
         self.axis = None if axis is None else torch.from_numpy(np.asarray(axis[indices], dtype=np.int64))
@@ -578,81 +578,71 @@ def _normalization_from_train(
     x_train_frames: np.ndarray,
     model_name: str,
     *,
+    valid_mask: np.ndarray | None = None,
     foreground_epsilon: float = 0.0,
     foreground_only: bool = False,
 ) -> dict[str, Any]:
     x_train_frames = np.asarray(x_train_frames, dtype=np.float32)
-    foreground = np.abs(x_train_frames) > float(foreground_epsilon)
-    if model_name == "cnn":
-        mean = np.zeros(x_train_frames.shape[1], dtype=np.float32)
-        std = np.ones(x_train_frames.shape[1], dtype=np.float32)
-        counts = []
-        for frame_idx in range(x_train_frames.shape[1]):
-            values = x_train_frames[:, frame_idx, :, :]
-            if foreground_only:
-                values = values[foreground[:, frame_idx, :, :]]
-            else:
-                values = values.reshape(-1)
-            counts.append(int(values.size))
-            if values.size:
-                mean[frame_idx] = float(values.mean())
-                frame_std = float(values.std())
-                std[frame_idx] = frame_std if frame_std >= 1e-6 else 1.0
-        std = np.where(std < 1e-6, 1.0, std)
-        return {
-            "mean": mean.astype(float),
-            "std": std.astype(float),
-            "foreground_only": bool(foreground_only),
-            "foreground_epsilon": float(foreground_epsilon),
-            "normalization_counts": counts,
-        }
-    values = x_train_frames[foreground] if foreground_only else x_train_frames.reshape(-1)
-    if values.size == 0:
-        values = x_train_frames.reshape(-1)
-    std = float(values.std())
-    if std < 1e-6:
-        std = 1.0
+    _, n_frames, height, width = x_train_frames.shape
+    if valid_mask is None:
+        valid = np.ones((height, width), dtype=bool)
+    else:
+        valid = np.asarray(valid_mask, dtype=bool)
+        if valid.shape != (height, width):
+            raise ValueError(f"valid_mask shape {valid.shape} does not match frame shape {(height, width)}")
+    mean = np.zeros((n_frames, height, width), dtype=np.float32)
+    std = np.ones((n_frames, height, width), dtype=np.float32)
+    if np.any(valid):
+        mean[:, valid] = x_train_frames[:, :, valid].mean(axis=0)
+        voxel_std = x_train_frames[:, :, valid].std(axis=0)
+        zero_std = voxel_std < 1e-6
+        voxel_std = np.where(zero_std, 1.0, voxel_std)
+        std[:, valid] = voxel_std.astype(np.float32)
+    else:
+        zero_std = np.asarray([], dtype=bool)
     return {
-        "mean": float(values.mean()) if values.size else 0.0,
-        "std": std,
-        "foreground_only": bool(foreground_only),
-        "foreground_epsilon": float(foreground_epsilon),
-        "normalization_counts": int(values.size),
+        "method": "train_fold_per_frame_per_voxel_zscore",
+        "mean": mean.astype(np.float32, copy=False),
+        "std": std.astype(np.float32, copy=False),
+        "valid_mask": valid,
+        "valid_voxel_count": int(valid.sum()),
+        "feature_count": int(valid.sum()) * int(n_frames),
+        "zero_std_features": int(np.sum(zero_std)),
     }
 
 
-def _foreground_roi_from_train(
-    x_train_frames: np.ndarray,
+def _spatial_roi_from_voxel_mask(
+    voxel_mask: np.ndarray,
     *,
     mode: str,
-    epsilon: float,
     margin: int,
 ) -> dict[str, Any]:
-    """Create a deep-model foreground transform from training data only."""
+    """Create a deep-model ROI from the same voxel mask used for flat features."""
 
-    _, _, height, width = x_train_frames.shape
+    full_mask = np.asarray(voxel_mask, dtype=bool)
+    height, width = full_mask.shape
     mode = str(mode).lower()
     roi = {
         "mode": mode,
+        "source": "window_voxel_mask",
         "original_shape": [int(height), int(width)],
         "bbox": [0, int(height), 0, int(width)],
         "roi_shape": [int(height), int(width)],
-        "active_pixel_fraction": 1.0,
+        "active_pixel_fraction": float(full_mask.mean()) if full_mask.size else 0.0,
+        "valid_voxel_count": int(full_mask.sum()),
         "status": "disabled" if mode == "none" else "full_image",
+        "_mask": full_mask,
     }
     if mode == "none":
         return roi
     if mode != "crop":
         raise ValueError(f"Unsupported deep_foreground_mode '{mode}'. Use 'crop' or 'none'.")
 
-    active = np.any(np.abs(np.asarray(x_train_frames)) > float(epsilon), axis=(0, 1))
-    active_count = int(active.sum())
-    roi["active_pixel_fraction"] = float(active_count / max(1, height * width))
-    if active_count == 0:
-        roi["status"] = "empty_foreground_fallback_full_image"
+    if not np.any(full_mask):
+        roi["status"] = "empty_voxel_mask_fallback_full_image"
         return roi
 
-    ys, xs = np.where(active)
+    ys, xs = np.where(full_mask)
     pad = max(0, int(margin))
     y0 = max(0, int(ys.min()) - pad)
     y1 = min(int(height), int(ys.max()) + pad + 1)
@@ -663,6 +653,7 @@ def _foreground_roi_from_train(
         return roi
     roi["bbox"] = [int(y0), int(y1), int(x0), int(x1)]
     roi["roi_shape"] = [int(y1 - y0), int(x1 - x0)]
+    roi["_mask"] = full_mask[y0:y1, x0:x1]
     roi["status"] = "cropped" if (y0, y1, x0, x1) != (0, height, 0, width) else "full_image_no_crop"
     return roi
 
@@ -672,6 +663,28 @@ def _apply_spatial_roi(x_frames: np.ndarray, spatial_roi: dict[str, Any] | None)
         return x_frames
     y0, y1, x0, x1 = [int(v) for v in spatial_roi["bbox"]]
     return x_frames[:, :, y0:y1, x0:x1]
+
+
+def _spatial_roi_summary(spatial_roi: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in spatial_roi.items() if not key.startswith("_")}
+
+
+def _normalization_summary(normalization: dict[str, Any]) -> dict[str, Any]:
+    mean = np.asarray(normalization["mean"], dtype=np.float32)
+    std = np.asarray(normalization["std"], dtype=np.float32)
+    valid = np.asarray(normalization["valid_mask"], dtype=bool)
+    finite_mean = mean[:, valid] if np.any(valid) else np.asarray([], dtype=np.float32)
+    finite_std = std[:, valid] if np.any(valid) else np.asarray([], dtype=np.float32)
+    return {
+        "method": normalization.get("method"),
+        "mean_shape": list(mean.shape),
+        "std_shape": list(std.shape),
+        "valid_voxel_count": int(normalization.get("valid_voxel_count", 0)),
+        "feature_count": int(normalization.get("feature_count", 0)),
+        "zero_std_features": int(normalization.get("zero_std_features", 0)),
+        "mean_of_train_means": float(finite_mean.mean()) if finite_mean.size else float("nan"),
+        "mean_of_train_stds": float(finite_std.mean()) if finite_std.size else float("nan"),
+    }
 
 
 def _make_validation_split(
@@ -709,6 +722,27 @@ def _build_model(
     torch = _require("torch")
     nn = torch.nn
 
+    class SpatialBinMeanPool2d(nn.Module):
+        """Deterministic coarse spatial pooling without CUDA adaptive-pool backward."""
+
+        def __init__(self, output_size: int) -> None:
+            super().__init__()
+            self.output_size = max(1, int(output_size))
+
+        def forward(self, x: Any) -> Any:
+            _, _, height, width = x.shape
+            bins = []
+            for y_bin in range(self.output_size):
+                y0 = (y_bin * height) // self.output_size
+                y1 = ((y_bin + 1) * height + self.output_size - 1) // self.output_size
+                row = []
+                for x_bin in range(self.output_size):
+                    x0 = (x_bin * width) // self.output_size
+                    x1 = ((x_bin + 1) * width + self.output_size - 1) // self.output_size
+                    row.append(x[:, :, y0:y1, x0:x1].mean(dim=(-2, -1)))
+                bins.append(torch.stack(row, dim=-1))
+            return torch.stack(bins, dim=-2)
+
     class ConvEncoder(nn.Module):
         def __init__(self, in_channels: int) -> None:
             super().__init__()
@@ -722,7 +756,7 @@ def _build_model(
                 nn.Conv2d(16, 32, kernel_size=3, padding=1),
                 nn.GroupNorm(8, 32),
                 nn.ReLU(inplace=True),
-                nn.AdaptiveAvgPool2d((pool, pool)),
+                SpatialBinMeanPool2d(pool),
                 nn.Flatten(),
             )
 
@@ -921,6 +955,7 @@ def _deep_train_predict_fold(
     *,
     model_name: str,
     x_frames: np.ndarray,
+    voxel_mask: np.ndarray,
     y: np.ndarray,
     labels_axis: np.ndarray | None,
     train_idx: np.ndarray,
@@ -936,15 +971,15 @@ def _deep_train_predict_fold(
     inner_train_idx, val_idx, val_strategy = _make_validation_split(
         train_idx, y, config.validation_fraction, seed
     )
-    spatial_roi = _foreground_roi_from_train(
-        x_frames[inner_train_idx],
+    spatial_roi = _spatial_roi_from_voxel_mask(
+        voxel_mask,
         mode=config.deep_foreground_mode,
-        epsilon=config.foreground_epsilon,
         margin=config.foreground_margin,
     )
     normalization = _normalization_from_train(
         _apply_spatial_roi(x_frames[inner_train_idx], spatial_roi),
         model_name,
+        valid_mask=np.asarray(spatial_roi["_mask"], dtype=bool),
         foreground_epsilon=config.foreground_epsilon,
         foreground_only=bool(config.normalize_foreground_only),
     )
@@ -1061,8 +1096,8 @@ def _deep_train_predict_fold(
         "history": history,
     }
     pred["model_info"] = {
-        "normalization": normalization,
-        "spatial_roi": spatial_roi,
+        "normalization": _normalization_summary(normalization),
+        "spatial_roi": _spatial_roi_summary(spatial_roi),
         "device": device,
         "batch_size": int(batch_size),
         "validation_strategy": val_strategy,
@@ -1148,6 +1183,7 @@ def run_window_benchmark(
                         pred_result = _deep_train_predict_fold(
                             model_name=model_name,
                             x_frames=window.x_frames,
+                            voxel_mask=window.voxel_mask,
                             y=y,
                             labels_axis=window.labels_axis,
                             train_idx=train_idx,
@@ -1575,6 +1611,8 @@ def run_benchmark(
                 "trial_indices_global": w.trial_indices_global.astype(int),
                 "x_flat_shape": list(w.x_flat.shape),
                 "x_cnn_shape": list(w.x_frames.shape),
+                "voxel_mask_shape": list(w.voxel_mask.shape),
+                "voxel_mask_count": int(np.asarray(w.voxel_mask, dtype=bool).sum()),
                 "combined_label_distribution": _distribution_dict(w.labels_combined),
                 "horizontal_label_distribution": _distribution_dict(w.labels_axis[:, 0])
                 if w.labels_axis is not None
@@ -1726,6 +1764,7 @@ def run_synthetic_tests() -> None:
             out = _deep_train_predict_fold(
                 model_name=model,
                 x_frames=x_frames,
+                voxel_mask=np.ones(x_frames.shape[-2:], dtype=bool),
                 y=y,
                 labels_axis=None,
                 train_idx=train_idx,
@@ -1774,6 +1813,7 @@ def run_synthetic_tests() -> None:
             out = _deep_train_predict_fold(
                 model_name=model,
                 x_frames=x8_frames,
+                voxel_mask=np.ones(x8_frames.shape[-2:], dtype=bool),
                 y=y8,
                 labels_axis=axis8,
                 train_idx=train8,
@@ -1810,6 +1850,21 @@ def run_synthetic_tests() -> None:
     assert set(val_idx).isdisjoint(set(test_idx))
     splits_again, _ = make_shared_splits(y, 2, 7)
     assert all(np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1]) for a, b in zip(splits, splits_again))
+
+    # Deep model spatial preprocessing: ROI comes from the feature voxel mask,
+    # and normalization is per frame and per voxel over train trials.
+    mask = np.zeros((10, 12), dtype=bool)
+    mask[3:7, 4:8] = True
+    masked_frames = np.zeros((6, 3, 10, 12), dtype=np.float32)
+    masked_frames[:, :, mask] = np.arange(6 * 3 * int(mask.sum()), dtype=np.float32).reshape(6, 3, int(mask.sum()))
+    roi = _spatial_roi_from_voxel_mask(mask, mode="crop", margin=1)
+    cropped = _apply_spatial_roi(masked_frames, roi)
+    norm = _normalization_from_train(cropped, "cnn", valid_mask=roi["_mask"])
+    masked_ds = _FrameDataset(masked_frames, np.array([0, 1, 0, 1, 0, 1]), None, np.arange(6), "cnn", "2target", norm, roi)
+    assert roi["bbox"] == [2, 8, 3, 9]
+    assert tuple(norm["mean"].shape) == (3, 6, 6)
+    assert norm["feature_count"] == int(mask.sum()) * 3
+    assert float(masked_ds.x[:, :, 0, 0].abs().sum()) == 0.0
 
     print("Synthetic benchmark tests passed.")
 
@@ -1915,7 +1970,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--foreground-epsilon",
         type=float,
         default=BenchmarkConfig.foreground_epsilon,
-        help="Absolute-value threshold used to detect foreground pixels for deep ROI cropping.",
+        help=(
+            "Legacy compatibility option. Deep ROI cropping now uses the window voxel_mask "
+            "from feature construction rather than image-value thresholds."
+        ),
     )
     parser.add_argument(
         "--foreground-margin",
@@ -1927,8 +1985,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--normalize-all-pixels",
         action="store_true",
         help=(
-            "For CNN/CNN+LSTM, estimate normalization from all pixels instead of train-fold "
-            "nonzero foreground values, and do not reset zero background to 0 after normalization."
+            "Legacy compatibility option. CNN/CNN+LSTM normalization is now train-fold "
+            "per-frame/per-voxel z-scoring over voxel_mask features."
         ),
     )
     parser.add_argument("--num-workers", type=int, default=BenchmarkConfig.num_workers, help="PyTorch DataLoader worker count.")
