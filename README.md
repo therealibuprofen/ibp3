@@ -111,6 +111,38 @@ MPLCONFIGDIR=/tmp/ppc_matplotlib_cache python run_batch_within_session_decoding.
   --diagnostic-only
 ```
 
+## Cross-Session 2-Target Linear Baseline
+
+The cross-session runner evaluates the predefined 2-target groups without
+mixing monkeys or effectors. It writes pairwise train-session to test-session
+matrices plus leave-one-session-out pooled-train results. For diagonal
+pairwise cells it reads existing within-session 10-fold benchmark outputs.
+
+```bash
+cd /Users/ibuprofen/Desktop/griggs3/PPC_direction_decoding_python
+MPLCONFIGDIR=/tmp/ppc_matplotlib_cache .venv/bin/python run_cross_session_decoding.py \
+  --data-root ../dataset/data1 \
+  --doppler-dir ../dataset/data1/doppler \
+  --project-record ../dataset/data1/project_record.json \
+  --within-session-results-dir /data2/yuq1ngr/ibp3/output/benchmark/data1 \
+  --output-dir output/crosss_session/2target \
+  --models pca_lda cpca_lda
+```
+
+Outputs:
+
+- `cross_session_pairwise_results.csv/json`
+- `cross_session_loso_results.csv/json`
+- `accuracy_matrix_<group_name>.csv`
+- `balanced_accuracy_matrix_<group_name>.csv`
+- `angular_error_matrix_<group_name>.csv`
+- `group_summary.csv/json`
+- `exclusion_log.csv`
+
+Rows that cannot be evaluated are retained with a `skip_reason` such as
+`skip_missing_session_file`, `skip_shape_mismatch`, or
+`skip_label_mapping_mismatch`.
+
 ## Notes
 
 - Input files are MATLAB v7.3 task-aligned `doppler_S*_R*+normcorre.mat`

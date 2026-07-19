@@ -1,5 +1,14 @@
 """Python within-session direction decoding for the PPC fUSI dataset."""
 
+from .cross_session import (
+    CrossSessionConfig,
+    CrossSessionGroup,
+    run_cross_session_decoding,
+    run_cross_session_pair,
+    run_loso_cross_session_group,
+    run_pairwise_cross_session_group,
+    summarize_cross_session_results,
+)
 from .within_session import (
     WithinSessionConfig,
     align_fusi_and_behavior,
@@ -18,6 +27,8 @@ from .within_session import (
 )
 
 __all__ = [
+    "CrossSessionConfig",
+    "CrossSessionGroup",
     "WithinSessionConfig",
     "align_fusi_and_behavior",
     "apply_bonferroni_correction",
@@ -32,4 +43,9 @@ __all__ = [
     "permutation_test_angular_error",
     "plot_within_session_results",
     "preprocess_power_doppler_session",
+    "run_cross_session_decoding",
+    "run_cross_session_pair",
+    "run_loso_cross_session_group",
+    "run_pairwise_cross_session_group",
+    "summarize_cross_session_results",
 ]
