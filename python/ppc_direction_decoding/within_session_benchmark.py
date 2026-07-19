@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob
 import importlib
 import importlib.util
 import json
@@ -1632,6 +1633,131 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> Non
             writer.writerow({field: _csv_value(row.get(field, "")) for field in fields})
 
 
+def _read_input_list(path: str | Path) -> list[str]:
+    rows = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            rows.append(line)
+    return rows
+
+
+def _expand_mat_paths(
+    *,
+    mat_paths: list[str] | None,
+    mat_globs: list[str] | None,
+    input_list: str | None,
+) -> list[Path]:
+    inputs: list[str] = []
+    inputs.extend(mat_paths or [])
+    if input_list:
+        inputs.extend(_read_input_list(input_list))
+    for pattern in mat_globs or []:
+        matches = sorted(glob.glob(pattern))
+        if not matches:
+            LOGGER.warning("No MAT files matched glob pattern: %s", pattern)
+        inputs.extend(matches)
+
+    expanded: list[Path] = []
+    seen: set[str] = set()
+    for item in inputs:
+        path = Path(item).expanduser()
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        expanded.append(path)
+    return expanded
+
+
+def run_batch_benchmark(
+    mat_paths: list[Path],
+    config: BenchmarkConfig,
+    *,
+    core_script: str | Path | None,
+    stop_on_error: bool = False,
+) -> list[dict[str, Any]]:
+    batch_rows: list[dict[str, Any]] = []
+    base_output = Path(config.output_dir)
+    base_output.mkdir(parents=True, exist_ok=True)
+    started = datetime.now(timezone.utc)
+    for idx, mat_path in enumerate(mat_paths, start=1):
+        LOGGER.info("Batch %d/%d: %s", idx, len(mat_paths), mat_path)
+        t0 = time.perf_counter()
+        row: dict[str, Any] = {
+            "batch_index": idx - 1,
+            "mat_path": str(mat_path),
+            "models": ",".join(config.models),
+            "status": "ok",
+            "error_message": "",
+            "runtime_seconds": 0.0,
+            "session_id": "",
+            "task_type": "",
+            "output_json": "",
+            "output_summary_csv": "",
+            "output_folds_csv": "",
+        }
+        try:
+            result = run_benchmark(mat_path, config, core_script=core_script)
+            session_id = str(result.get("session_id", ""))
+            row["session_id"] = session_id
+            row["task_type"] = str(result.get("task_type", ""))
+            if session_id:
+                session_dir = base_output / session_id
+                row["output_json"] = str(session_dir / f"{session_id}_benchmark.json")
+                row["output_summary_csv"] = str(session_dir / f"{session_id}_benchmark_summary.csv")
+                row["output_folds_csv"] = str(session_dir / f"{session_id}_benchmark_folds.csv")
+        except Exception as exc:
+            row["status"] = "error"
+            row["error_message"] = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+            LOGGER.exception("Batch item failed: %s", mat_path)
+            if stop_on_error:
+                row["runtime_seconds"] = float(time.perf_counter() - t0)
+                batch_rows.append(row)
+                break
+        row["runtime_seconds"] = float(time.perf_counter() - t0)
+        batch_rows.append(row)
+
+    timestamp = started.strftime("%Y%m%dT%H%M%SZ")
+    batch_csv = base_output / f"batch_benchmark_{timestamp}.csv"
+    batch_json = base_output / f"batch_benchmark_{timestamp}.json"
+    fields = [
+        "batch_index",
+        "mat_path",
+        "session_id",
+        "task_type",
+        "models",
+        "status",
+        "error_message",
+        "runtime_seconds",
+        "output_json",
+        "output_summary_csv",
+        "output_folds_csv",
+    ]
+    _write_csv(batch_csv, batch_rows, fields)
+    with batch_json.open("w", encoding="utf-8") as handle:
+        json.dump(
+            _jsonable(
+                {
+                    "created_at_utc": started.isoformat(),
+                    "config": asdict(config),
+                    "n_inputs": len(mat_paths),
+                    "n_success": sum(row["status"] == "ok" for row in batch_rows),
+                    "n_failed": sum(row["status"] != "ok" for row in batch_rows),
+                    "rows": batch_rows,
+                }
+            ),
+            handle,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    LOGGER.info("Saved batch report %s and %s", batch_json, batch_csv)
+    return batch_rows
+
+
 def _merge_existing_result_by_model(
     *,
     result: dict[str, Any],
@@ -2120,6 +2246,13 @@ def run_synthetic_tests() -> None:
     v_bal = _balanced_accuracy_for_labels(np.array([1, 1, 2, 2, 3, 3]), np.array([1, 1, 1, 2, 3, 1]), np.arange(1, 4))
     assert math.isclose(float(np.nanmean([h_bal, v_bal])), (h_bal + v_bal) / 2.0)
 
+    expanded = _expand_mat_paths(
+        mat_paths=["/tmp/session_a.mat", "/tmp/session_a.mat"],
+        mat_globs=[],
+        input_list=None,
+    )
+    assert [str(path) for path in expanded] == ["/tmp/session_a.mat"]
+
     print("Synthetic benchmark tests passed.")
 
 
@@ -2161,7 +2294,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run a fair within-session fUS decoding benchmark sharing trials, windows, labels, and CV splits."
     )
-    parser.add_argument("mat_path", nargs="?", help="Path to doppler_S*_R*+normcorre.mat or rt_fUS_data_S*_R*.mat")
+    parser.add_argument(
+        "mat_paths",
+        nargs="*",
+        help="One or more MAT files, e.g. doppler_S*_R*+normcorre.mat or rt_fUS_data_S*_R*.mat.",
+    )
+    parser.add_argument(
+        "--mat-glob",
+        nargs="+",
+        default=None,
+        help="Glob pattern(s) for batch input, for example '../dataset/data2/doppler/*.mat'. Quote patterns in the shell.",
+    )
+    parser.add_argument(
+        "--input-list",
+        default=None,
+        help="Text file containing one MAT path per line. Blank lines and lines starting with # are ignored.",
+    )
+    parser.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="In batch mode, stop after the first failed session instead of continuing.",
+    )
     parser.add_argument(
         "--core-script",
         default=str(_default_core_path()),
@@ -2312,8 +2465,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         run_synthetic_tests()
         return 0
-    if not args.mat_path:
-        parser.error("mat_path is required unless --self-test is used.")
+    mat_paths = _expand_mat_paths(
+        mat_paths=args.mat_paths,
+        mat_globs=args.mat_glob,
+        input_list=args.input_list,
+    )
+    if not mat_paths:
+        parser.error("At least one MAT path, --mat-glob pattern, or --input-list is required unless --self-test is used.")
     config = BenchmarkConfig(
         models=_parse_models(args.models),
         mode=args.mode,
@@ -2354,7 +2512,10 @@ def main(argv: list[str] | None = None) -> int:
         merge_existing=not args.overwrite,
         deterministic_torch=not args.no_deterministic,
     )
-    run_benchmark(args.mat_path, config, core_script=args.core_script)
+    if len(mat_paths) == 1:
+        run_benchmark(mat_paths[0], config, core_script=args.core_script)
+    else:
+        run_batch_benchmark(mat_paths, config, core_script=args.core_script, stop_on_error=args.stop_on_error)
     return 0
 
 
