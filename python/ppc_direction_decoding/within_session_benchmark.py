@@ -334,16 +334,31 @@ def _window_frame_tensor(
     images: np.ndarray,
     trial_indices: np.ndarray,
     frame_indices: list[int],
-    voxel_mask: np.ndarray,
 ) -> np.ndarray:
     frames = []
     for trial in trial_indices:
         chunks = [images[:, :, int(frame), int(trial)].astype(np.float32, copy=False) for frame in frame_indices]
         trial_frames = np.stack(chunks, axis=0)
-        trial_frames[:, ~voxel_mask] = 0.0
         frames.append(trial_frames)
     arr = np.stack(frames, axis=0)
     return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+
+
+def _flatten_window_frames(x_frames: np.ndarray, trial_indices: np.ndarray, voxel_mask: np.ndarray) -> np.ndarray:
+    """Flatten window frames with the same frame/voxel order used by within_session.py."""
+
+    x = np.asarray(x_frames, dtype=np.float32)
+    mask = np.asarray(voxel_mask, dtype=bool)
+    n_trials = int(np.asarray(trial_indices).size)
+    n_frames = int(x.shape[1])
+    n_voxels = int(mask.sum())
+    if n_voxels <= 0:
+        raise ValueError("No voxels remain in fold-specific voxel mask.")
+    features = np.empty((n_trials, n_voxels * n_frames), dtype=np.float32)
+    for row, trial in enumerate(np.asarray(trial_indices, dtype=int)):
+        chunks = [x[int(trial), frame][mask].reshape(-1, order="F") for frame in range(n_frames)]
+        features[row, :] = np.concatenate(chunks)
+    return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
 
 
 def _power_doppler_voxel_mask(
@@ -413,16 +428,21 @@ def _power_doppler_voxel_mask(
     return mask.astype(bool, copy=False), info
 
 
-def _window_power_mask(
-    images: np.ndarray,
-    trial_indices: np.ndarray,
-    frame_indices: np.ndarray,
-    *,
-    percentile: float,
-    min_fraction: float,
+def _fold_voxel_mask_from_train(
+    x_train_frames: np.ndarray,
+    candidate_mask: np.ndarray,
+    config: BenchmarkConfig,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    stack = images[:, :, np.asarray(frame_indices, dtype=int), :][:, :, :, np.asarray(trial_indices, dtype=int)]
-    return _power_doppler_voxel_mask(stack, percentile=percentile, min_fraction=min_fraction)
+    stack = np.transpose(np.asarray(x_train_frames, dtype=np.float32), (2, 3, 1, 0))
+    mask, info = _power_doppler_voxel_mask(
+        stack,
+        percentile=config.voxel_mask_percentile,
+        min_fraction=config.voxel_mask_min_fraction,
+        candidate_mask=np.asarray(candidate_mask, dtype=bool),
+    )
+    info["source"] = "outer_train_mean_power_doppler"
+    info["leakage_control"] = "computed_inside_outer_fold_from_train_trials_only"
+    return mask, info
 
 
 def prepare_benchmark_windows(
@@ -483,54 +503,44 @@ def prepare_benchmark_windows(
             if start < 0:
                 raise ValueError("Cannot build fixed_memory_3frames features: fewer than 3 frames exist.")
             frame_indices = np.arange(start, memory_end_index, dtype=int)
-            trial_ok = np.asarray(valid_mask, dtype=bool)
-            candidate_trials = np.flatnonzero(trial_ok)
-            voxel_mask, voxel_mask_info = _window_power_mask(
-                images,
-                candidate_trials,
-                frame_indices,
-                percentile=config.voxel_mask_percentile,
-                min_fraction=config.voxel_mask_min_fraction,
-            )
-            x_flat, trial_indices, winfo = core.build_fixed_memory_3frames_features(
-                images, aligned, valid_mask, voxel_mask=voxel_mask
-            )
+            trial_indices = np.flatnonzero(np.asarray(valid_mask, dtype=bool))
+            winfo = {
+                "eval_index": int(frame_indices[-1]),
+                "memory_end_index": int(memory_end_index),
+                "frame_indices": frame_indices.astype(int).tolist(),
+                "n_window_frames": int(frame_indices.size),
+                "n_trials": int(trial_indices.size),
+                "fold_specific_voxel_mask": True,
+            }
         else:
             assert eval_index is not None
             if eval_index < aligned.cue_index:
                 frame_indices = np.arange(0, eval_index + 1, dtype=int)
             else:
                 frame_indices = np.arange(aligned.cue_index, eval_index + 1, dtype=int)
-            candidate_trials = np.flatnonzero(np.asarray(valid_mask, dtype=bool))
-            voxel_mask, voxel_mask_info = _window_power_mask(
-                images,
-                candidate_trials,
-                frame_indices,
-                percentile=config.voxel_mask_percentile,
-                min_fraction=config.voxel_mask_min_fraction,
-            )
-            x_flat, trial_indices, winfo = core.build_dynamic_window_features(
-                images,
-                int(eval_index),
-                aligned.cue_index,
-                valid_mask,
-                voxel_mask=voxel_mask,
-            )
+            trial_indices = np.flatnonzero(np.asarray(valid_mask, dtype=bool))
+            winfo = {
+                "eval_index": int(eval_index),
+                "frame_indices": frame_indices.astype(int).tolist(),
+                "n_window_frames": int(frame_indices.size),
+                "n_trials": int(trial_indices.size),
+                "fold_specific_voxel_mask": True,
+            }
 
         if trial_indices.size < config.min_trials_per_timepoint:
             LOGGER.warning("Skipping window %s: only %d trials", window_mode, trial_indices.size)
             continue
-        winfo["voxel_mask_info"] = voxel_mask_info
-        x_frames = _window_frame_tensor(images, trial_indices, winfo["frame_indices"], voxel_mask)
+        x_frames = _window_frame_tensor(images, trial_indices, winfo["frame_indices"])
+        candidate_voxel_mask = np.ones(x_frames.shape[-2:], dtype=bool)
         labels_combined = combined_all[trial_indices].astype(int)
         labels_axis = axis_all[trial_indices].astype(int) if axis_all is not None else None
         prepared.append(
             PreparedWindow(
                 name=window_mode,
                 eval_index=int(winfo["eval_index"]),
-                x_flat=x_flat,
+                x_flat=np.empty((trial_indices.size, 0), dtype=np.float32),
                 x_frames=x_frames,
-                voxel_mask=np.asarray(voxel_mask, dtype=bool),
+                voxel_mask=candidate_voxel_mask,
                 trial_indices_global=trial_indices.astype(int),
                 window_info=winfo,
                 labels_combined=labels_combined,
@@ -1075,16 +1085,26 @@ def _evaluate_deep(
             total += n
             if task_type == "8target":
                 logits_h, logits_v = outputs
-                pred_h = torch.argmax(logits_h, dim=1) + 1
-                pred_v = torch.argmax(logits_v, dim=1) + 1
+                ph = torch.softmax(logits_h, dim=1)
+                pv = torch.softmax(logits_v, dim=1)
+                pred_h_axis = torch.argmax(ph, dim=1) + 1
+                pred_v_axis = torch.argmax(pv, dim=1) + 1
                 y_h = batch[1] + 1
                 y_v = batch[2] + 1
-                pred = pred_h + 3 * (pred_v - 1)
+                valid_labels = [1, 2, 3, 4, 6, 7, 8, 9]
+                joint_cols = []
+                for combined_label in valid_labels:
+                    h_idx = (combined_label - 1) % 3
+                    v_idx = (combined_label - 1) // 3
+                    joint_cols.append(ph[:, h_idx] * pv[:, v_idx])
+                joint_valid = torch.stack(joint_cols, dim=1)
+                valid_tensor = torch.as_tensor(valid_labels, dtype=torch.long, device=ph.device)
+                pred = valid_tensor[torch.argmax(joint_valid, dim=1)]
                 true = y_h + 3 * (y_v - 1)
                 true_h_all.extend(y_h.cpu().numpy().astype(int).tolist())
-                pred_h_all.extend(pred_h.cpu().numpy().astype(int).tolist())
+                pred_h_all.extend(pred_h_axis.cpu().numpy().astype(int).tolist())
                 true_v_all.extend(y_v.cpu().numpy().astype(int).tolist())
-                pred_v_all.extend(pred_v.cpu().numpy().astype(int).tolist())
+                pred_v_all.extend(pred_v_axis.cpu().numpy().astype(int).tolist())
             else:
                 pred = torch.argmax(outputs, dim=1)
                 true = batch[1]
@@ -1127,15 +1147,21 @@ def _predict_deep(model: Any, loader: Any, task_type: str, device: str) -> dict[
                 logits_h, logits_v = outputs
                 ph = torch.softmax(logits_h, dim=1)
                 pv = torch.softmax(logits_v, dim=1)
-                pred_h = torch.argmax(ph, dim=1) + 1
-                pred_v = torch.argmax(pv, dim=1) + 1
-                combined = pred_h + 3 * (pred_v - 1)
+                valid_labels = [1, 2, 3, 4, 6, 7, 8, 9]
                 joint_cols = []
-                for combined_label in range(1, 10):
+                for combined_label in valid_labels:
                     h_idx = (combined_label - 1) % 3
                     v_idx = (combined_label - 1) // 3
                     joint_cols.append(ph[:, h_idx] * pv[:, v_idx])
-                joint = torch.stack(joint_cols, dim=1)
+                joint_valid = torch.stack(joint_cols, dim=1)
+                best = torch.argmax(joint_valid, dim=1)
+                valid_tensor = torch.as_tensor(valid_labels, dtype=torch.long, device=ph.device)
+                combined = valid_tensor[best]
+                pred_h = ((combined - 1) % 3) + 1
+                pred_v = ((combined - 1) // 3) + 1
+                joint = torch.zeros((ph.shape[0], 9), dtype=ph.dtype, device=ph.device)
+                for col, combined_label in enumerate(valid_labels):
+                    joint[:, combined_label - 1] = joint_valid[:, col]
                 pred_h_all.extend(pred_h.cpu().numpy().astype(int).tolist())
                 pred_v_all.extend(pred_v.cpu().numpy().astype(int).tolist())
                 pred_combined.extend(combined.cpu().numpy().astype(int).tolist())
@@ -1229,7 +1255,6 @@ def _deep_train_predict_fold(
         if val_idx.size
         else None
     )
-    test_ds = _FrameDataset(x_frames, y, labels_axis, test_idx, model_name, task_type, normalization, spatial_roi)
     batch_size = max(1, min(int(config.batch_size), len(train_ds)))
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -1245,8 +1270,6 @@ def _deep_train_predict_fold(
         if val_ds is not None
         else None
     )
-    test_loader = data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=config.num_workers)
-
     _, t_frames, h, w = _apply_spatial_roi(x_frames[:1], spatial_roi).shape
     model = _build_model(model_name, task_type, t_frames, h, w, config).to(device)
     class_weights = _make_deep_class_weights(
@@ -1258,9 +1281,12 @@ def _deep_train_predict_fold(
         enabled=bool(config.use_class_weights),
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    best_state = None
     best_score: float | None = None
     best_epoch = 0
+    best_axis_score: float | None = None
+    best_axis_epoch = 0
+    best_combined_score: float | None = None
+    best_combined_epoch = 0
     epochs_without_improvement = 0
     history = []
     t0 = time.perf_counter()
@@ -1338,13 +1364,26 @@ def _deep_train_predict_fold(
         if improved:
             best_score = monitor
             best_epoch = int(epoch)
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
+        axis_candidate = (
+            val_metrics["validation_axis_balanced_accuracy"]
+            if task_type == "8target"
+            else val_metrics["validation_balanced_accuracy"]
+        )
+        combined_candidate = val_metrics["validation_balanced_accuracy"]
+        if np.isfinite(axis_candidate) and (best_axis_score is None or axis_candidate > best_axis_score + 1e-8):
+            best_axis_score = float(axis_candidate)
+            best_axis_epoch = int(epoch)
+        if np.isfinite(combined_candidate) and (
+            best_combined_score is None or combined_candidate > best_combined_score + 1e-8
+        ):
+            best_combined_score = float(combined_candidate)
+            best_combined_epoch = int(epoch)
         if val_loader is not None and epochs_without_improvement >= int(config.patience):
             break
-    refit_epochs = int(best_epoch) if int(best_epoch) > 0 else max(1, len(history))
+    refit_epochs = int(best_axis_epoch or best_epoch) if int(best_axis_epoch or best_epoch) > 0 else max(1, len(history))
     refit_t0 = time.perf_counter()
     final_normalization = _normalization_from_train(
         _apply_spatial_roi(x_frames[train_idx], spatial_roi),
@@ -1395,8 +1434,6 @@ def _deep_train_predict_fold(
         shuffle=False,
         num_workers=config.num_workers,
     )
-    set_global_seed(seed, deterministic_torch=config.deterministic_torch)
-    final_model = _build_model(model_name, task_type, t_frames, h, w, config).to(device)
     final_class_weights = _make_deep_class_weights(
         y=y,
         labels_axis=labels_axis,
@@ -1405,29 +1442,102 @@ def _deep_train_predict_fold(
         device=device,
         enabled=bool(config.use_class_weights),
     )
-    final_optimizer = torch.optim.AdamW(
-        final_model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
+
+    def refit_variant(n_epochs: int, variant_seed_offset: int) -> tuple[dict[str, Any], dict[str, float], list[dict[str, float]], float]:
+        start = time.perf_counter()
+        set_global_seed(seed + int(variant_seed_offset), deterministic_torch=config.deterministic_torch)
+        variant_model = _build_model(model_name, task_type, t_frames, h, w, config).to(device)
+        variant_optimizer = torch.optim.AdamW(
+            variant_model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+        variant_history = _train_deep_epochs(
+            model=variant_model,
+            loader=final_train_loader,
+            optimizer=variant_optimizer,
+            task_type=task_type,
+            device=device,
+            class_weights=final_class_weights,
+            n_epochs=n_epochs,
+        )
+        variant_train_metrics = _evaluate_deep(
+            variant_model,
+            final_train_eval_loader,
+            task_type,
+            device,
+            final_class_weights,
+        )
+        variant_pred = _predict_deep(variant_model, final_test_loader, task_type, device)
+        return variant_pred, variant_train_metrics, variant_history, float(time.perf_counter() - start)
+
+    pred, train_metrics, refit_history, axis_refit_time = refit_variant(refit_epochs, 0)
+    combined_refit_epochs = (
+        int(best_combined_epoch) if int(best_combined_epoch) > 0 else max(1, len(history))
     )
-    refit_history = _train_deep_epochs(
-        model=final_model,
-        loader=final_train_loader,
-        optimizer=final_optimizer,
-        task_type=task_type,
-        device=device,
-        class_weights=final_class_weights,
-        n_epochs=refit_epochs,
-    )
-    train_metrics = _evaluate_deep(final_model, final_train_eval_loader, task_type, device, final_class_weights)
-    pred = _predict_deep(final_model, final_test_loader, task_type, device)
+    combined_pred = None
+    combined_train_metrics = None
+    combined_refit_history = None
+    combined_refit_time = 0.0
+    if task_type == "8target":
+        combined_pred, combined_train_metrics, combined_refit_history, combined_refit_time = refit_variant(
+            combined_refit_epochs,
+            10_000,
+        )
+
+    def checkpoint_summary(pred_obj: dict[str, Any], train_metric_obj: dict[str, float]) -> dict[str, Any]:
+        pred_combined = np.asarray(pred_obj["pred_combined"], dtype=int)
+        true_combined = y[test_idx].astype(int)
+        labels_for_bal = np.arange(1, 10, dtype=int) if task_type == "8target" else np.arange(0, 2, dtype=int)
+        out = {
+            "test_accuracy": float(np.mean(pred_combined == true_combined)) if true_combined.size else float("nan"),
+            "test_balanced_accuracy": _balanced_accuracy_for_labels(true_combined, pred_combined, labels_for_bal),
+            "train_accuracy": float(train_metric_obj["validation_accuracy"]),
+            "train_balanced_accuracy": float(train_metric_obj["validation_balanced_accuracy"]),
+        }
+        if task_type == "8target" and labels_axis is not None:
+            out.update(
+                {
+                    "test_horizontal_balanced_accuracy": _balanced_accuracy_for_labels(
+                        labels_axis[test_idx, 0],
+                        np.asarray(pred_obj["pred_horizontal"], dtype=int),
+                        np.arange(1, 4),
+                    ),
+                    "test_vertical_balanced_accuracy": _balanced_accuracy_for_labels(
+                        labels_axis[test_idx, 1],
+                        np.asarray(pred_obj["pred_vertical"], dtype=int),
+                        np.arange(1, 4),
+                    ),
+                    "train_axis_balanced_accuracy": float(train_metric_obj["validation_axis_balanced_accuracy"]),
+                }
+            )
+            out["test_axis_balanced_accuracy"] = float(
+                np.nanmean([out["test_horizontal_balanced_accuracy"], out["test_vertical_balanced_accuracy"]])
+            )
+        return out
+
+    checkpoint_comparison = {
+        "axis_balanced": {
+            "best_epoch": int(refit_epochs),
+            "validation_score": float(best_axis_score) if best_axis_score is not None else None,
+            "refit_time": float(axis_refit_time),
+            **checkpoint_summary(pred, train_metrics),
+        }
+    }
+    if combined_pred is not None and combined_train_metrics is not None:
+        checkpoint_comparison["combined_balanced"] = {
+            "best_epoch": int(combined_refit_epochs),
+            "validation_score": float(best_combined_score) if best_combined_score is not None else None,
+            "refit_time": float(combined_refit_time),
+            **checkpoint_summary(combined_pred, combined_train_metrics),
+        }
     pred["train_log"] = {
         "training_time": float(time.perf_counter() - t0),
         "validation_training_time": float(refit_t0 - t0),
         "refit_training_time": float(time.perf_counter() - refit_t0),
-        "best_epoch": int(best_epoch),
-        "best_monitor_name": history[best_epoch - 1]["monitor_name"] if best_epoch > 0 else None,
-        "best_monitor_value": float(best_score) if best_score is not None else None,
+        "best_epoch": int(refit_epochs),
+        "best_monitor_name": "validation_axis_balanced_accuracy" if task_type == "8target" else "validation_balanced_accuracy",
+        "best_monitor_value": float(best_axis_score) if best_axis_score is not None else None,
         "epochs_run": len(history),
         "refit_epochs": int(refit_epochs),
         "refit_on_full_outer_train": True,
@@ -1441,6 +1551,9 @@ def _deep_train_predict_fold(
         "inner_train_indices_local": inner_train_idx.astype(int).tolist(),
         "history": history,
         "refit_history": refit_history,
+        "combined_checkpoint_refit_epochs": int(combined_refit_epochs) if task_type == "8target" else None,
+        "combined_checkpoint_refit_history": combined_refit_history,
+        "checkpoint_comparison": checkpoint_comparison,
     }
     pred["model_info"] = {
         "validation_normalization": _normalization_summary(normalization),
@@ -1517,23 +1630,31 @@ def run_window_benchmark(
                     fold_seed,
                 )
                 try:
+                    fold_voxel_mask, fold_voxel_mask_info = _fold_voxel_mask_from_train(
+                        window.x_frames[train_idx],
+                        window.voxel_mask,
+                        config,
+                    )
                     if model_name in LINEAR_MODELS:
+                        x_train_fold = _flatten_window_frames(window.x_frames, train_idx, fold_voxel_mask)
+                        x_test_fold = _flatten_window_frames(window.x_frames, test_idx, fold_voxel_mask)
                         pred_result = _linear_predict_fold(
                             core=core,
                             model_name=model_name,
-                            x_train=window.x_flat[train_idx],
-                            x_test=window.x_flat[test_idx],
+                            x_train=x_train_fold,
+                            x_test=x_test_fold,
                             y_train=y[train_idx],
                             labels_axis_train=window.labels_axis[train_idx] if window.labels_axis is not None else None,
                             task_type=task_type,
                             config=config,
                             seed=fold_seed,
                         )
+                        pred_result.setdefault("model_info", {})["fold_voxel_mask_info"] = fold_voxel_mask_info
                     elif model_name in DEEP_MODELS:
                         pred_result = _deep_train_predict_fold(
                             model_name=model_name,
                             x_frames=window.x_frames,
-                            voxel_mask=window.voxel_mask,
+                            voxel_mask=fold_voxel_mask,
                             y=y,
                             labels_axis=window.labels_axis,
                             train_idx=train_idx,
@@ -1542,6 +1663,7 @@ def run_window_benchmark(
                             config=config,
                             seed=fold_seed,
                         )
+                        pred_result.setdefault("model_info", {})["fold_voxel_mask_info"] = fold_voxel_mask_info
                     else:
                         raise ValueError(f"Unsupported model '{model_name}'")
                     metrics = compute_metrics(
@@ -1585,6 +1707,8 @@ def run_window_benchmark(
                     LOGGER.exception("Model %s repeat %s fold %s failed", model_name, repeat, fold_id)
 
                 train_log = pred_result.get("train_log", {}) if pred_result else {}
+                checkpoint_comparison = train_log.get("checkpoint_comparison", {}) if train_log else {}
+                combined_checkpoint = checkpoint_comparison.get("combined_balanced", {})
                 row = {
                     "session_id": "",
                     "task_type": task_type,
@@ -1612,6 +1736,11 @@ def run_window_benchmark(
                     "train_accuracy": train_log.get("train_accuracy"),
                     "train_balanced_accuracy": train_log.get("train_balanced_accuracy"),
                     "train_axis_balanced_accuracy": train_log.get("train_axis_balanced_accuracy"),
+                    "combined_checkpoint_best_epoch": combined_checkpoint.get("best_epoch"),
+                    "combined_checkpoint_test_accuracy": combined_checkpoint.get("test_accuracy"),
+                    "combined_checkpoint_test_balanced_accuracy": combined_checkpoint.get("test_balanced_accuracy"),
+                    "combined_checkpoint_test_axis_balanced_accuracy": combined_checkpoint.get("test_axis_balanced_accuracy"),
+                    "combined_checkpoint_train_accuracy": combined_checkpoint.get("train_accuracy"),
                     "training_time": train_log.get("training_time", 0.0),
                     "status": status,
                     "error_message": error_message,
@@ -1872,6 +2001,27 @@ def run_batch_benchmark(
     return batch_rows
 
 
+def _regularization_ablation_configs(config: BenchmarkConfig, mode: str) -> list[tuple[str, BenchmarkConfig]]:
+    if mode == "none":
+        return [("main", config)]
+    if mode != "small":
+        raise ValueError(f"Unsupported regularization ablation mode: {mode}")
+    variants: list[tuple[str, dict[str, Any]]] = [
+        ("baseline", {}),
+        ("dropout_0p4", {"deep_dropout": 0.4}),
+        ("weight_decay_1e-3", {"weight_decay": 1e-3}),
+        ("hidden_dim_32", {"deep_hidden_dim": 32}),
+    ]
+    out = []
+    base = asdict(config)
+    for name, overrides in variants:
+        cfg_dict = dict(base)
+        cfg_dict.update(overrides)
+        cfg_dict["output_dir"] = str(Path(config.output_dir) / f"reg_ablation_{name}")
+        out.append((name, BenchmarkConfig(**cfg_dict)))
+    return out
+
+
 def _merge_existing_result_by_model(
     *,
     result: dict[str, Any],
@@ -2089,10 +2239,11 @@ def run_benchmark(
                 "window": w.name,
                 "eval_index": int(w.eval_index),
                 "trial_indices_global": w.trial_indices_global.astype(int),
-                "x_flat_shape": list(w.x_flat.shape),
+                "x_flat_shape": "fold_specific_outer_train_mask",
                 "x_cnn_shape": list(w.x_frames.shape),
                 "voxel_mask_shape": list(w.voxel_mask.shape),
                 "voxel_mask_count": int(np.asarray(w.voxel_mask, dtype=bool).sum()),
+                "voxel_mask_is_fold_specific": True,
                 "combined_label_distribution": _distribution_dict(w.labels_combined),
                 "horizontal_label_distribution": _distribution_dict(w.labels_axis[:, 0])
                 if w.labels_axis is not None
@@ -2149,6 +2300,11 @@ def run_benchmark(
         "train_accuracy",
         "train_balanced_accuracy",
         "train_axis_balanced_accuracy",
+        "combined_checkpoint_best_epoch",
+        "combined_checkpoint_test_accuracy",
+        "combined_checkpoint_test_balanced_accuracy",
+        "combined_checkpoint_test_axis_balanced_accuracy",
+        "combined_checkpoint_train_accuracy",
         "training_time",
         "status",
         "error_message",
@@ -2310,6 +2466,7 @@ def run_synthetic_tests() -> None:
         assert out["pred_combined"].shape == y8[test8].shape
         if model in DEEP_MODELS:
             assert out["proba_combined"].shape[1] == 9
+            assert 5 not in set(out["pred_combined"].astype(int).tolist())
     center_metrics = compute_metrics(
         y_true=np.array([1, 9]),
         y_pred=np.array([5, 9]),
@@ -2358,6 +2515,17 @@ def run_synthetic_tests() -> None:
     assert int(power_mask.sum()) < finite_values.shape[0] * finite_values.shape[1]
     assert power_mask[4, 5]
     assert not power_mask[0, 0]
+    fold_mask_frames = np.zeros((6, 3, 10, 12), dtype=np.float32)
+    fold_mask_frames[:3, :, 2:4, 2:4] = 5.0
+    fold_mask_frames[3:, :, 7:9, 7:9] = 50.0
+    fold_mask, fold_mask_info = _fold_voxel_mask_from_train(
+        fold_mask_frames[:3],
+        np.ones((10, 12), dtype=bool),
+        BenchmarkConfig(voxel_mask_percentile=90.0, voxel_mask_min_fraction=0.01),
+    )
+    assert fold_mask_info["leakage_control"] == "computed_inside_outer_fold_from_train_trials_only"
+    assert fold_mask[2, 2]
+    assert not fold_mask[8, 8]
 
     h_bal = _balanced_accuracy_for_labels(np.array([1, 1, 2, 2, 3, 3]), np.array([1, 2, 2, 2, 1, 3]), np.arange(1, 4))
     v_bal = _balanced_accuracy_for_labels(np.array([1, 1, 2, 2, 3, 3]), np.array([1, 1, 1, 2, 3, 1]), np.arange(1, 4))
@@ -2587,6 +2755,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-spatial-filter", action="store_true", help="Disable pillbox spatial filtering in preprocessing.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing benchmark JSON/CSV instead of merging by model.")
     parser.add_argument(
+        "--regularization-ablation",
+        choices=["none", "small"],
+        default="none",
+        help=(
+            "Optional one-factor-at-a-time deep-model regularization ablation. 'small' runs "
+            "baseline, dropout_0p4, weight_decay_1e-3, and hidden_dim_32 in separate output subdirectories."
+        ),
+    )
+    parser.add_argument(
         "--no-deterministic",
         action="store_true",
         help=(
@@ -2650,10 +2827,19 @@ def main(argv: list[str] | None = None) -> int:
         merge_existing=not args.overwrite,
         deterministic_torch=not args.no_deterministic,
     )
-    if len(mat_paths) == 1:
-        run_benchmark(mat_paths[0], config, core_script=args.core_script)
-    else:
-        run_batch_benchmark(mat_paths, config, core_script=args.core_script, stop_on_error=args.stop_on_error)
+    ablation_configs = _regularization_ablation_configs(config, args.regularization_ablation)
+    for ablation_name, ablation_config in ablation_configs:
+        if args.regularization_ablation != "none":
+            LOGGER.info("Running regularization ablation variant: %s", ablation_name)
+        if len(mat_paths) == 1:
+            run_benchmark(mat_paths[0], ablation_config, core_script=args.core_script)
+        else:
+            run_batch_benchmark(
+                mat_paths,
+                ablation_config,
+                core_script=args.core_script,
+                stop_on_error=args.stop_on_error,
+            )
     return 0
 
 
