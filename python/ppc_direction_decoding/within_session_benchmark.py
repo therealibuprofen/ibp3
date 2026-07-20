@@ -58,14 +58,12 @@ class BenchmarkConfig:
     patience: int = 15
     validation_fraction: float = 0.2
     epoch_log_interval: int = 10
-    cnn_spatial_pool: int = 4
+    cnn_spatial_pool: int = 8
     deep_hidden_dim: int = 64
     deep_dropout: float = 0.2
     use_class_weights: bool = True
     voxel_mask_percentile: float = 20.0
     voxel_mask_min_fraction: float = 0.05
-    deep_train_mask_percentile: float = 20.0
-    deep_train_mask_min_fraction: float = 0.05
     deep_foreground_mode: str = "crop"
     foreground_epsilon: float = 1e-8
     foreground_margin: int = 2
@@ -427,24 +425,6 @@ def _window_power_mask(
     return _power_doppler_voxel_mask(stack, percentile=percentile, min_fraction=min_fraction)
 
 
-def _train_fold_power_mask(
-    x_train_frames: np.ndarray,
-    candidate_mask: np.ndarray,
-    *,
-    percentile: float,
-    min_fraction: float,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    stack = np.transpose(np.asarray(x_train_frames, dtype=np.float32), (2, 3, 1, 0))
-    mask, info = _power_doppler_voxel_mask(
-        stack,
-        percentile=percentile,
-        min_fraction=min_fraction,
-        candidate_mask=candidate_mask,
-    )
-    info["source"] = "inner_train_mean_power_doppler"
-    return mask, info
-
-
 def prepare_benchmark_windows(
     *,
     core: Any,
@@ -669,10 +649,27 @@ class _FrameDataset:
         std = np.asarray(normalization["std"], dtype=np.float32).reshape(1, *normalization["std"].shape)
         arr = (arr - mean) / std
         arr = np.where(invalid, 0.0, arr)
-        if model_name == "cnn":
-            pass
+        mask_map = valid_mask.astype(np.float32, copy=False)
+        if valid_mask.shape[1] > 1:
+            x_coord = np.linspace(-1.0, 1.0, valid_mask.shape[1], dtype=np.float32)
         else:
-            arr = arr[:, :, None, :, :]
+            x_coord = np.zeros(valid_mask.shape[1], dtype=np.float32)
+        if valid_mask.shape[0] > 1:
+            y_coord = np.linspace(-1.0, 1.0, valid_mask.shape[0], dtype=np.float32)
+        else:
+            y_coord = np.zeros(valid_mask.shape[0], dtype=np.float32)
+        coord_x = np.broadcast_to(x_coord.reshape(1, -1), valid_mask.shape).astype(np.float32) * mask_map
+        coord_y = np.broadcast_to(y_coord.reshape(-1, 1), valid_mask.shape).astype(np.float32) * mask_map
+        aux = np.stack([mask_map, coord_x, coord_y], axis=0)
+        if model_name == "cnn":
+            aux_batch = np.broadcast_to(aux.reshape(1, *aux.shape), (arr.shape[0], *aux.shape))
+            arr = np.concatenate([arr, aux_batch], axis=1)
+        else:
+            aux_seq = np.broadcast_to(
+                aux.reshape(1, 1, *aux.shape),
+                (arr.shape[0], arr.shape[1], *aux.shape),
+            )
+            arr = np.concatenate([arr[:, :, None, :, :], aux_seq], axis=2)
         self.x = torch.from_numpy(arr.astype(np.float32, copy=False))
         self.y = torch.from_numpy(np.asarray(y[indices], dtype=np.int64))
         self.axis = None if axis is None else torch.from_numpy(np.asarray(axis[indices], dtype=np.int64))
@@ -837,14 +834,14 @@ def _build_model(
     torch = _require("torch")
     nn = torch.nn
 
-    class SpatialBinMeanPool2d(nn.Module):
-        """Deterministic coarse spatial pooling without CUDA adaptive-pool backward."""
+    class MaskedSpatialBinMeanPool2d(nn.Module):
+        """Deterministic masked coarse spatial pooling."""
 
         def __init__(self, output_size: int) -> None:
             super().__init__()
             self.output_size = max(1, int(output_size))
 
-        def forward(self, x: Any) -> Any:
+        def forward(self, x: Any, mask: Any) -> Any:
             _, _, height, width = x.shape
             bins = []
             for y_bin in range(self.output_size):
@@ -854,7 +851,10 @@ def _build_model(
                 for x_bin in range(self.output_size):
                     x0 = (x_bin * width) // self.output_size
                     x1 = ((x_bin + 1) * width + self.output_size - 1) // self.output_size
-                    row.append(x[:, :, y0:y1, x0:x1].mean(dim=(-2, -1)))
+                    x_bin_values = x[:, :, y0:y1, x0:x1]
+                    mask_bin = mask[:, :, y0:y1, x0:x1]
+                    denom = mask_bin.sum(dim=(-2, -1)).clamp_min(1.0)
+                    row.append((x_bin_values * mask_bin).sum(dim=(-2, -1)) / denom)
                 bins.append(torch.stack(row, dim=-1))
             return torch.stack(bins, dim=-2)
 
@@ -863,27 +863,27 @@ def _build_model(
             super().__init__()
             pool = max(1, int(config.cnn_spatial_pool))
             self.output_dim = 32 * pool * pool
-            self.net = nn.Sequential(
-                nn.Conv2d(in_channels, 16, kernel_size=3, padding=1),
-                nn.GroupNorm(4, 16),
-                nn.ReLU(inplace=True),
-                nn.MaxPool2d(2),
-                nn.Conv2d(16, 32, kernel_size=3, padding=1),
-                nn.GroupNorm(8, 32),
-                nn.ReLU(inplace=True),
-                SpatialBinMeanPool2d(pool),
-                nn.Flatten(),
-            )
+            self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3, padding=1, bias=False)
+            self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False)
+            self.relu = nn.ReLU(inplace=True)
+            self.pool = nn.MaxPool2d(2)
+            self.spatial_pool = MaskedSpatialBinMeanPool2d(pool)
 
-        def forward(self, x: Any) -> Any:
-            return self.net(x)
+        def forward(self, x: Any, mask: Any) -> Any:
+            mask = mask.to(dtype=x.dtype)
+            z = self.relu(self.conv1(x)) * mask
+            z = self.pool(z)
+            mask = torch.nn.functional.max_pool2d(mask, kernel_size=2)
+            z = self.relu(self.conv2(z)) * mask
+            z = self.spatial_pool(z, mask)
+            return torch.flatten(z, start_dim=1)
 
     class SmallCNN(nn.Module):
         def __init__(self) -> None:
             super().__init__()
             if task_type == "8target":
-                self.encoder_h = ConvEncoder(input_frames)
-                self.encoder_v = ConvEncoder(input_frames)
+                self.encoder_h = ConvEncoder(input_frames + 3)
+                self.encoder_v = ConvEncoder(input_frames + 3)
                 self.project_h = nn.Sequential(
                     nn.Linear(self.encoder_h.output_dim, int(config.deep_hidden_dim)),
                     nn.ReLU(inplace=True),
@@ -897,7 +897,7 @@ def _build_model(
                 self.head_h = nn.Linear(int(config.deep_hidden_dim), 3)
                 self.head_v = nn.Linear(int(config.deep_hidden_dim), 3)
             else:
-                self.encoder = ConvEncoder(input_frames)
+                self.encoder = ConvEncoder(input_frames + 3)
                 self.project = nn.Sequential(
                     nn.Linear(self.encoder.output_dim, int(config.deep_hidden_dim)),
                     nn.ReLU(inplace=True),
@@ -906,11 +906,12 @@ def _build_model(
                 self.head = nn.Linear(int(config.deep_hidden_dim), 2)
 
         def forward(self, x: Any) -> Any:
+            mask = x[:, input_frames : input_frames + 1]
             if task_type == "8target":
-                z_h = self.project_h(self.encoder_h(x))
-                z_v = self.project_v(self.encoder_v(x))
+                z_h = self.project_h(self.encoder_h(x, mask))
+                z_v = self.project_v(self.encoder_v(x, mask))
                 return self.head_h(z_h), self.head_v(z_v)
-            z = self.project(self.encoder(x))
+            z = self.project(self.encoder(x, mask))
             return self.head(z)
 
     class SmallCNNLSTM(nn.Module):
@@ -918,8 +919,8 @@ def _build_model(
             super().__init__()
             self.dropout = nn.Dropout(float(config.deep_dropout))
             if task_type == "8target":
-                self.frame_encoder_h = ConvEncoder(1)
-                self.frame_encoder_v = ConvEncoder(1)
+                self.frame_encoder_h = ConvEncoder(4)
+                self.frame_encoder_v = ConvEncoder(4)
                 self.frame_project_h = nn.Sequential(
                     nn.Linear(self.frame_encoder_h.output_dim, int(config.deep_hidden_dim)),
                     nn.ReLU(inplace=True),
@@ -943,7 +944,7 @@ def _build_model(
                 self.head_h = nn.Linear(int(config.deep_hidden_dim), 3)
                 self.head_v = nn.Linear(int(config.deep_hidden_dim), 3)
             else:
-                self.frame_encoder = ConvEncoder(1)
+                self.frame_encoder = ConvEncoder(4)
                 self.frame_project = nn.Sequential(
                     nn.Linear(self.frame_encoder.output_dim, int(config.deep_hidden_dim)),
                     nn.ReLU(inplace=True),
@@ -960,14 +961,16 @@ def _build_model(
             b, t, c, h, w = x.shape
             if task_type == "8target":
                 flat = x.reshape(b * t, c, h, w)
-                z_h = self.frame_project_h(self.frame_encoder_h(flat)).reshape(b, t, -1)
-                z_v = self.frame_project_v(self.frame_encoder_v(flat)).reshape(b, t, -1)
+                mask = flat[:, 1:2]
+                z_h = self.frame_project_h(self.frame_encoder_h(flat, mask)).reshape(b, t, -1)
+                z_v = self.frame_project_v(self.frame_encoder_v(flat, mask)).reshape(b, t, -1)
                 out_h, _ = self.lstm_h(z_h)
                 out_v, _ = self.lstm_v(z_v)
                 last_h = self.dropout(out_h[:, -1, :])
                 last_v = self.dropout(out_v[:, -1, :])
                 return self.head_h(last_h), self.head_v(last_v)
-            z = self.frame_encoder(x.reshape(b * t, c, h, w))
+            flat = x.reshape(b * t, c, h, w)
+            z = self.frame_encoder(flat, flat[:, 1:2])
             z = self.frame_project(z).reshape(b, t, -1)
             out, _ = self.lstm(z)
             last = self.dropout(out[:, -1, :])
@@ -1150,6 +1153,35 @@ def _predict_deep(model: Any, loader: Any, task_type: str, device: str) -> dict[
     }
 
 
+def _train_deep_epochs(
+    *,
+    model: Any,
+    loader: Any,
+    optimizer: Any,
+    task_type: str,
+    device: str,
+    class_weights: dict[str, Any],
+    n_epochs: int,
+) -> list[dict[str, float]]:
+    history = []
+    for epoch in range(1, max(0, int(n_epochs)) + 1):
+        model.train()
+        total_loss = 0.0
+        total = 0
+        for batch in loader:
+            batch = tuple(item.to(device) for item in batch)
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model(batch[0])
+            loss = _deep_loss(outputs, batch, task_type, class_weights)
+            loss.backward()
+            optimizer.step()
+            n = int(batch[0].shape[0])
+            total_loss += float(loss.item()) * n
+            total += n
+        history.append({"epoch": float(epoch), "train_loss": total_loss / total if total else float("nan")})
+    return history
+
+
 def _deep_train_predict_fold(
     *,
     model_name: str,
@@ -1170,18 +1202,11 @@ def _deep_train_predict_fold(
     inner_train_idx, val_idx, val_strategy = _make_validation_split(
         train_idx, y, config.validation_fraction, seed
     )
-    train_voxel_mask, train_voxel_mask_info = _train_fold_power_mask(
-        x_frames[inner_train_idx],
-        np.asarray(voxel_mask, dtype=bool),
-        percentile=config.deep_train_mask_percentile,
-        min_fraction=config.deep_train_mask_min_fraction,
-    )
     spatial_roi = _spatial_roi_from_voxel_mask(
-        train_voxel_mask,
+        np.asarray(voxel_mask, dtype=bool),
         mode=config.deep_foreground_mode,
         margin=config.foreground_margin,
     )
-    spatial_roi["train_voxel_mask_info"] = train_voxel_mask_info
     normalization = _normalization_from_train(
         _apply_spatial_roi(x_frames[inner_train_idx], spatial_roi),
         model_name,
@@ -1319,25 +1344,111 @@ def _deep_train_predict_fold(
             epochs_without_improvement += 1
         if val_loader is not None and epochs_without_improvement >= int(config.patience):
             break
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    pred = _predict_deep(model, test_loader, task_type, device)
+    refit_epochs = int(best_epoch) if int(best_epoch) > 0 else max(1, len(history))
+    refit_t0 = time.perf_counter()
+    final_normalization = _normalization_from_train(
+        _apply_spatial_roi(x_frames[train_idx], spatial_roi),
+        model_name,
+        valid_mask=np.asarray(spatial_roi["_mask"], dtype=bool),
+        foreground_epsilon=config.foreground_epsilon,
+        foreground_only=bool(config.normalize_foreground_only),
+    )
+    final_train_ds = _FrameDataset(
+        x_frames,
+        y,
+        labels_axis,
+        train_idx,
+        model_name,
+        task_type,
+        final_normalization,
+        spatial_roi,
+    )
+    final_test_ds = _FrameDataset(
+        x_frames,
+        y,
+        labels_axis,
+        test_idx,
+        model_name,
+        task_type,
+        final_normalization,
+        spatial_roi,
+    )
+    final_batch_size = max(1, min(int(config.batch_size), len(final_train_ds)))
+    final_generator = torch.Generator()
+    final_generator.manual_seed(seed)
+    final_train_loader = data.DataLoader(
+        final_train_ds,
+        batch_size=final_batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        generator=final_generator,
+    )
+    final_train_eval_loader = data.DataLoader(
+        final_train_ds,
+        batch_size=final_batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+    )
+    final_test_loader = data.DataLoader(
+        final_test_ds,
+        batch_size=final_batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+    )
+    set_global_seed(seed, deterministic_torch=config.deterministic_torch)
+    final_model = _build_model(model_name, task_type, t_frames, h, w, config).to(device)
+    final_class_weights = _make_deep_class_weights(
+        y=y,
+        labels_axis=labels_axis,
+        train_idx=train_idx,
+        task_type=task_type,
+        device=device,
+        enabled=bool(config.use_class_weights),
+    )
+    final_optimizer = torch.optim.AdamW(
+        final_model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    refit_history = _train_deep_epochs(
+        model=final_model,
+        loader=final_train_loader,
+        optimizer=final_optimizer,
+        task_type=task_type,
+        device=device,
+        class_weights=final_class_weights,
+        n_epochs=refit_epochs,
+    )
+    train_metrics = _evaluate_deep(final_model, final_train_eval_loader, task_type, device, final_class_weights)
+    pred = _predict_deep(final_model, final_test_loader, task_type, device)
     pred["train_log"] = {
         "training_time": float(time.perf_counter() - t0),
+        "validation_training_time": float(refit_t0 - t0),
+        "refit_training_time": float(time.perf_counter() - refit_t0),
         "best_epoch": int(best_epoch),
         "best_monitor_name": history[best_epoch - 1]["monitor_name"] if best_epoch > 0 else None,
         "best_monitor_value": float(best_score) if best_score is not None else None,
         "epochs_run": len(history),
+        "refit_epochs": int(refit_epochs),
+        "refit_on_full_outer_train": True,
+        "train_accuracy": float(train_metrics["validation_accuracy"]),
+        "train_balanced_accuracy": float(train_metrics["validation_balanced_accuracy"]),
+        "train_horizontal_balanced_accuracy": float(train_metrics["validation_horizontal_balanced_accuracy"]),
+        "train_vertical_balanced_accuracy": float(train_metrics["validation_vertical_balanced_accuracy"]),
+        "train_axis_balanced_accuracy": float(train_metrics["validation_axis_balanced_accuracy"]),
         "validation_strategy": val_strategy,
         "validation_indices_local": val_idx.astype(int).tolist(),
         "inner_train_indices_local": inner_train_idx.astype(int).tolist(),
         "history": history,
+        "refit_history": refit_history,
     }
     pred["model_info"] = {
-        "normalization": _normalization_summary(normalization),
+        "validation_normalization": _normalization_summary(normalization),
+        "normalization": _normalization_summary(final_normalization),
         "spatial_roi": _spatial_roi_summary(spatial_roi),
         "device": device,
-        "batch_size": int(batch_size),
+        "batch_size": int(final_batch_size),
+        "validation_batch_size": int(batch_size),
         "validation_strategy": val_strategy,
         "cnn_spatial_pool": int(config.cnn_spatial_pool),
         "deep_hidden_dim": int(config.deep_hidden_dim),
@@ -1346,7 +1457,7 @@ def _deep_train_predict_fold(
         "use_class_weights": bool(config.use_class_weights),
         "class_weights": {
             key: value.detach().cpu().numpy().astype(float).tolist()
-            for key, value in class_weights.items()
+            for key, value in final_class_weights.items()
         },
     }
     return pred
@@ -1498,6 +1609,9 @@ def run_window_benchmark(
                     "best_epoch": train_log.get("best_epoch"),
                     "best_monitor_name": train_log.get("best_monitor_name"),
                     "best_monitor_value": train_log.get("best_monitor_value"),
+                    "train_accuracy": train_log.get("train_accuracy"),
+                    "train_balanced_accuracy": train_log.get("train_balanced_accuracy"),
+                    "train_axis_balanced_accuracy": train_log.get("train_axis_balanced_accuracy"),
                     "training_time": train_log.get("training_time", 0.0),
                     "status": status,
                     "error_message": error_message,
@@ -2032,6 +2146,9 @@ def run_benchmark(
         "best_epoch",
         "best_monitor_name",
         "best_monitor_value",
+        "train_accuracy",
+        "train_balanced_accuracy",
+        "train_axis_balanced_accuracy",
         "training_time",
         "status",
         "error_message",
@@ -2253,6 +2370,44 @@ def run_synthetic_tests() -> None:
     )
     assert [str(path) for path in expanded] == ["/tmp/session_a.mat"]
 
+    overfit_config = BenchmarkConfig(
+        models=("cnn",),
+        n_splits=2,
+        repeats=1,
+        random_seed=17,
+        batch_size=8,
+        learning_rate=5e-3,
+        weight_decay=0.0,
+        max_epochs=40,
+        patience=40,
+        validation_fraction=0.0,
+        epoch_log_interval=0,
+        cnn_spatial_pool=4,
+        deep_hidden_dim=32,
+        deep_dropout=0.0,
+        device="cpu",
+        detrend_window=0,
+        spatial_filter_radius=0,
+    )
+    y_overfit = np.array([0, 1] * 4, dtype=int)
+    x_overfit = np.zeros((8, 3, 8, 8), dtype=np.float32)
+    x_overfit[y_overfit == 0, :, 1:3, 1:3] = 4.0
+    x_overfit[y_overfit == 1, :, 5:7, 5:7] = 4.0
+    overfit_idx = np.arange(8, dtype=int)
+    overfit_out = _deep_train_predict_fold(
+        model_name="cnn",
+        x_frames=x_overfit,
+        voxel_mask=np.ones(x_overfit.shape[-2:], dtype=bool),
+        y=y_overfit,
+        labels_axis=None,
+        train_idx=overfit_idx,
+        test_idx=overfit_idx,
+        task_type="2target",
+        config=overfit_config,
+        seed=23,
+    )
+    assert float(overfit_out["train_log"]["train_accuracy"]) >= 0.875
+
     print("Synthetic benchmark tests passed.")
 
 
@@ -2351,8 +2506,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=BenchmarkConfig.cnn_spatial_pool,
         help=(
-            "CNN adaptive spatial pooling size. 4 preserves coarse fUS spatial layout; "
-            "1 is global pooling and is more likely to collapse on small 8-target data."
+            "CNN masked spatial bin pooling size. Default 8 preserves more coarse fUS "
+            "spatial layout than the earlier 4x4 pooling."
         ),
     )
     parser.add_argument(
@@ -2388,27 +2543,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Minimum fraction of candidate pixels retained in the window-level Power Doppler mask.",
     )
     parser.add_argument(
-        "--deep-train-mask-percentile",
-        type=float,
-        default=BenchmarkConfig.deep_train_mask_percentile,
-        help=(
-            "Deep-model fold mask threshold computed from inner-train mean Power Doppler "
-            "inside the window-level mask."
-        ),
-    )
-    parser.add_argument(
-        "--deep-train-mask-min-fraction",
-        type=float,
-        default=BenchmarkConfig.deep_train_mask_min_fraction,
-        help="Minimum fraction of window-mask pixels retained in the deep train-fold mask.",
-    )
-    parser.add_argument(
         "--deep-foreground-mode",
         choices=["crop", "none"],
         default=BenchmarkConfig.deep_foreground_mode,
         help=(
             "Foreground handling for CNN/CNN+LSTM. 'crop' computes an ROI from the "
-            "inner-train Power Doppler mask; 'none' keeps the full image."
+            "same window voxel_mask used by PCA; 'none' keeps the full image."
         ),
     )
     parser.add_argument(
@@ -2493,8 +2633,6 @@ def main(argv: list[str] | None = None) -> int:
         use_class_weights=not args.no_class_weights,
         voxel_mask_percentile=args.voxel_mask_percentile,
         voxel_mask_min_fraction=args.voxel_mask_min_fraction,
-        deep_train_mask_percentile=args.deep_train_mask_percentile,
-        deep_train_mask_min_fraction=args.deep_train_mask_min_fraction,
         deep_foreground_mode=args.deep_foreground_mode,
         foreground_epsilon=args.foreground_epsilon,
         foreground_margin=args.foreground_margin,
