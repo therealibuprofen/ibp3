@@ -60,7 +60,7 @@ class BenchmarkConfig:
     epoch_log_interval: int = 10
     cnn_spatial_pool: int = 8
     deep_hidden_dim: int = 64
-    deep_dropout: float = 0.2
+    deep_dropout: float = 0.4
     use_class_weights: bool = True
     voxel_mask_percentile: float = 20.0
     voxel_mask_min_fraction: float = 0.05
