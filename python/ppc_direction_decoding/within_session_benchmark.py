@@ -1158,7 +1158,7 @@ def _predict_deep(model: Any, loader: Any, task_type: str, device: str) -> dict[
                 valid_tensor = torch.as_tensor(valid_labels, dtype=torch.long, device=ph.device)
                 combined = valid_tensor[best]
                 pred_h = ((combined - 1) % 3) + 1
-                pred_v = ((combined - 1) // 3) + 1
+                pred_v = torch.div(combined - 1, 3, rounding_mode="floor") + 1
                 joint = torch.zeros((ph.shape[0], 9), dtype=ph.dtype, device=ph.device)
                 for col, combined_label in enumerate(valid_labels):
                     joint[:, combined_label - 1] = joint_valid[:, col]
@@ -1285,8 +1285,6 @@ def _deep_train_predict_fold(
     best_epoch = 0
     best_axis_score: float | None = None
     best_axis_epoch = 0
-    best_combined_score: float | None = None
-    best_combined_epoch = 0
     epochs_without_improvement = 0
     history = []
     t0 = time.perf_counter()
@@ -1372,15 +1370,9 @@ def _deep_train_predict_fold(
             if task_type == "8target"
             else val_metrics["validation_balanced_accuracy"]
         )
-        combined_candidate = val_metrics["validation_balanced_accuracy"]
         if np.isfinite(axis_candidate) and (best_axis_score is None or axis_candidate > best_axis_score + 1e-8):
             best_axis_score = float(axis_candidate)
             best_axis_epoch = int(epoch)
-        if np.isfinite(combined_candidate) and (
-            best_combined_score is None or combined_candidate > best_combined_score + 1e-8
-        ):
-            best_combined_score = float(combined_candidate)
-            best_combined_epoch = int(epoch)
         if val_loader is not None and epochs_without_improvement >= int(config.patience):
             break
     refit_epochs = int(best_axis_epoch or best_epoch) if int(best_axis_epoch or best_epoch) > 0 else max(1, len(history))
@@ -1472,69 +1464,11 @@ def _deep_train_predict_fold(
         return variant_pred, variant_train_metrics, variant_history, float(time.perf_counter() - start)
 
     pred, train_metrics, refit_history, axis_refit_time = refit_variant(refit_epochs, 0)
-    combined_refit_epochs = (
-        int(best_combined_epoch) if int(best_combined_epoch) > 0 else max(1, len(history))
-    )
-    combined_pred = None
-    combined_train_metrics = None
-    combined_refit_history = None
-    combined_refit_time = 0.0
-    if task_type == "8target":
-        combined_pred, combined_train_metrics, combined_refit_history, combined_refit_time = refit_variant(
-            combined_refit_epochs,
-            10_000,
-        )
-
-    def checkpoint_summary(pred_obj: dict[str, Any], train_metric_obj: dict[str, float]) -> dict[str, Any]:
-        pred_combined = np.asarray(pred_obj["pred_combined"], dtype=int)
-        true_combined = y[test_idx].astype(int)
-        labels_for_bal = np.arange(1, 10, dtype=int) if task_type == "8target" else np.arange(0, 2, dtype=int)
-        out = {
-            "test_accuracy": float(np.mean(pred_combined == true_combined)) if true_combined.size else float("nan"),
-            "test_balanced_accuracy": _balanced_accuracy_for_labels(true_combined, pred_combined, labels_for_bal),
-            "train_accuracy": float(train_metric_obj["validation_accuracy"]),
-            "train_balanced_accuracy": float(train_metric_obj["validation_balanced_accuracy"]),
-        }
-        if task_type == "8target" and labels_axis is not None:
-            out.update(
-                {
-                    "test_horizontal_balanced_accuracy": _balanced_accuracy_for_labels(
-                        labels_axis[test_idx, 0],
-                        np.asarray(pred_obj["pred_horizontal"], dtype=int),
-                        np.arange(1, 4),
-                    ),
-                    "test_vertical_balanced_accuracy": _balanced_accuracy_for_labels(
-                        labels_axis[test_idx, 1],
-                        np.asarray(pred_obj["pred_vertical"], dtype=int),
-                        np.arange(1, 4),
-                    ),
-                    "train_axis_balanced_accuracy": float(train_metric_obj["validation_axis_balanced_accuracy"]),
-                }
-            )
-            out["test_axis_balanced_accuracy"] = float(
-                np.nanmean([out["test_horizontal_balanced_accuracy"], out["test_vertical_balanced_accuracy"]])
-            )
-        return out
-
-    checkpoint_comparison = {
-        "axis_balanced": {
-            "best_epoch": int(refit_epochs),
-            "validation_score": float(best_axis_score) if best_axis_score is not None else None,
-            "refit_time": float(axis_refit_time),
-            **checkpoint_summary(pred, train_metrics),
-        }
-    }
-    if combined_pred is not None and combined_train_metrics is not None:
-        checkpoint_comparison["combined_balanced"] = {
-            "best_epoch": int(combined_refit_epochs),
-            "validation_score": float(best_combined_score) if best_combined_score is not None else None,
-            "refit_time": float(combined_refit_time),
-            **checkpoint_summary(combined_pred, combined_train_metrics),
-        }
     pred["train_log"] = {
         "training_time": float(time.perf_counter() - t0),
         "validation_training_time": float(refit_t0 - t0),
         "refit_training_time": float(time.perf_counter() - refit_t0),
+        "axis_refit_time": float(axis_refit_time),
         "best_epoch": int(refit_epochs),
         "best_monitor_name": "validation_axis_balanced_accuracy" if task_type == "8target" else "validation_balanced_accuracy",
         "best_monitor_value": float(best_axis_score) if best_axis_score is not None else None,
@@ -1551,9 +1485,6 @@ def _deep_train_predict_fold(
         "inner_train_indices_local": inner_train_idx.astype(int).tolist(),
         "history": history,
         "refit_history": refit_history,
-        "combined_checkpoint_refit_epochs": int(combined_refit_epochs) if task_type == "8target" else None,
-        "combined_checkpoint_refit_history": combined_refit_history,
-        "checkpoint_comparison": checkpoint_comparison,
     }
     pred["model_info"] = {
         "validation_normalization": _normalization_summary(normalization),
@@ -1707,8 +1638,6 @@ def run_window_benchmark(
                     LOGGER.exception("Model %s repeat %s fold %s failed", model_name, repeat, fold_id)
 
                 train_log = pred_result.get("train_log", {}) if pred_result else {}
-                checkpoint_comparison = train_log.get("checkpoint_comparison", {}) if train_log else {}
-                combined_checkpoint = checkpoint_comparison.get("combined_balanced", {})
                 row = {
                     "session_id": "",
                     "task_type": task_type,
@@ -1736,11 +1665,6 @@ def run_window_benchmark(
                     "train_accuracy": train_log.get("train_accuracy"),
                     "train_balanced_accuracy": train_log.get("train_balanced_accuracy"),
                     "train_axis_balanced_accuracy": train_log.get("train_axis_balanced_accuracy"),
-                    "combined_checkpoint_best_epoch": combined_checkpoint.get("best_epoch"),
-                    "combined_checkpoint_test_accuracy": combined_checkpoint.get("test_accuracy"),
-                    "combined_checkpoint_test_balanced_accuracy": combined_checkpoint.get("test_balanced_accuracy"),
-                    "combined_checkpoint_test_axis_balanced_accuracy": combined_checkpoint.get("test_axis_balanced_accuracy"),
-                    "combined_checkpoint_train_accuracy": combined_checkpoint.get("train_accuracy"),
                     "training_time": train_log.get("training_time", 0.0),
                     "status": status,
                     "error_message": error_message,
@@ -2300,11 +2224,6 @@ def run_benchmark(
         "train_accuracy",
         "train_balanced_accuracy",
         "train_axis_balanced_accuracy",
-        "combined_checkpoint_best_epoch",
-        "combined_checkpoint_test_accuracy",
-        "combined_checkpoint_test_balanced_accuracy",
-        "combined_checkpoint_test_axis_balanced_accuracy",
-        "combined_checkpoint_train_accuracy",
         "training_time",
         "status",
         "error_message",
